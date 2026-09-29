@@ -24,6 +24,17 @@ RAVEN_INCLUDES=-I$(builddir) -I$(builddir)/obj $(BDB_CPPFLAGS) $(BOOST_CPPFLAGS)
 RAVEN_INCLUDES += -I$(srcdir)/secp256k1/include
 RAVEN_INCLUDES += $(UNIVALUE_CFLAGS)
 
+# RandomX is vendored as a git submodule in src/randomx and built by this
+# autotools tree (upstream CMake is deliberately NOT used, see
+# doc/randomx.md). Objects go into a convenience library so the
+# library can carry its own compiler flags (-O3 -maes, and the per-file
+# -mssse3/-mavx2) without leaking them into the rest of the tree.
+LIBRANDOMX=librandomx.a
+RANDOMX_INCLUDES=-I$(srcdir)/randomx/src
+librandomx_a_CPPFLAGS=$(AM_CPPFLAGS) $(RANDOMX_INCLUDES) $(PIC_FLAGS) $(PIE_FLAGS)
+librandomx_a_CXXFLAGS=$(AM_CXXFLAGS) -O3 $(RANDOMX_AES_CFLAGS) $(PIC_FLAGS) $(PIE_FLAGS)
+librandomx_a_CFLAGS=-O3 $(RANDOMX_AES_CFLAGS) $(PIC_FLAGS) $(PIE_FLAGS)
+
 LIBRAVEN_SERVER=libraven_server.a
 LIBRAVEN_COMMON=libraven_common.a
 LIBRAVEN_CONSENSUS=libraven_consensus.a
@@ -57,6 +68,10 @@ EXTRA_LIBRARIES += \
   $(LIBRAVEN_CLI) \
   $(LIBRAVEN_WALLET) \
   $(LIBRAVEN_ZMQ)
+
+if USE_RANDOMX
+EXTRA_LIBRARIES += $(LIBRANDOMX)
+endif
 
 lib_LTLIBRARIES = $(LIBRAVENCONSENSUS)
 
@@ -262,6 +277,7 @@ libraven_server_a_SOURCES = \
   miner.cpp \
   net.cpp \
   net_processing.cpp \
+  newvld.cpp \
   noui.cpp \
   assets/assets.cpp \
   assets/assetdb.cpp \
@@ -294,10 +310,59 @@ libraven_server_a_SOURCES = \
   txdb.cpp \
   txmempool.cpp \
   ui_interface.cpp \
-  validation.cpp \
   validationinterface.cpp \
   versionbits.cpp \
   $(RAVEN_CORE_H)
+
+# RandomX (vendored git submodule at src/randomx, see doc/randomx.md).
+# The source list and the per-file flags below mirror RandomX's own CMakeLists.txt
+# for the x86-64 / aarch64 targets. Upstream's CMake build is intentionally NOT
+# used: this is a single autotools build system.
+if USE_RANDOMX
+librandomx_a_SOURCES = \
+  randomx/src/aes_hash.cpp \
+  randomx/src/allocator.cpp \
+  randomx/src/argon2_core.c \
+  randomx/src/argon2_ref.c \
+  randomx/src/argon2_ssse3.c \
+  randomx/src/argon2_avx2.c \
+  randomx/src/assembly_generator_x86.cpp \
+  randomx/src/blake2/blake2b.c \
+  randomx/src/blake2_generator.cpp \
+  randomx/src/bytecode_machine.cpp \
+  randomx/src/cpu.cpp \
+  randomx/src/dataset.cpp \
+  randomx/src/instruction.cpp \
+  randomx/src/instructions_portable.cpp \
+  randomx/src/reciprocal.c \
+  randomx/src/randomx.cpp \
+  randomx/src/soft_aes.cpp \
+  randomx/src/superscalar.cpp \
+  randomx/src/virtual_machine.cpp \
+  randomx/src/virtual_memory.c \
+  randomx/src/vm_compiled.cpp \
+  randomx/src/vm_compiled_light.cpp \
+  randomx/src/vm_interpreted.cpp \
+  randomx/src/vm_interpreted_light.cpp
+
+if RANDOMX_X86_64
+librandomx_a_SOURCES += \
+  randomx/src/jit_compiler_x86.cpp \
+  randomx/src/jit_compiler_x86_static.S
+endif
+
+if RANDOMX_AARCH64
+librandomx_a_SOURCES += \
+  randomx/src/jit_compiler_a64.cpp \
+  randomx/src/jit_compiler_a64_static.S
+endif
+
+# Upstream applies the SIMD flags to these two files only, and RandomX picks
+# between the portable and the SIMD Argon2 implementation at runtime
+# (randomx.cpp), so these flags must not leak into the rest of the library.
+librandomx_a-argon2_ssse3.$(OBJEXT): CFLAGS += $(RANDOMX_SSSE3_CFLAGS)
+librandomx_a-argon2_avx2.$(OBJEXT): CFLAGS += $(RANDOMX_AVX2_CFLAGS)
+endif
 
 if ENABLE_ZMQ
 libraven_zmq_a_CPPFLAGS = $(RAVEN_INCLUDES) $(ZMQ_CFLAGS)
@@ -500,6 +565,10 @@ ravend_LDADD = \
   $(LIBSECP256K1)
 
 ravend_LDADD += $(BOOST_LIBS) $(BDB_LIBS) $(SSL_LIBS) $(CRYPTO_LIBS) $(MINIUPNPC_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS)
+
+if USE_RANDOMX
+ravend_LDADD += $(LIBRANDOMX)
+endif
 
 # raven-cli binary #
 raven_cli_SOURCES = raven-cli.cpp

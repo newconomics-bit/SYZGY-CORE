@@ -11,7 +11,7 @@ define(_COPYRIGHT_HOLDERS,[The %s developers])
 define(_COPYRIGHT_HOLDERS_SUBSTITUTION,[[Raven Core]])
 AC_INIT([Raven Core],m4_join([.], _CLIENT_VERSION_MAJOR, _CLIENT_VERSION_MINOR, _CLIENT_VERSION_REVISION, m4_if(_CLIENT_VERSION_BUILD, [0], [], _CLIENT_VERSION_BUILD))m4_if(_CLIENT_VERSION_RC, [0], [], [test]_CLIENT_VERSION_RC),[https://github.com/RavenProject/Ravencoin/issues],[raven],[https://ravencoin.org/])
 
-AC_CONFIG_SRCDIR([src/validation.cpp])
+AC_CONFIG_SRCDIR([src/newvld.cpp])
 AC_CONFIG_HEADERS([src/config/raven-config.h])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([build-aux/m4])
@@ -53,6 +53,11 @@ else
   CXXFLAGS_overridden=no
 fi
 AC_PROG_CXX
+
+dnl RandomX ships preprocessed assembler sources (*.S) which automake
+dnl routes through CCAS/CCASFLAGS.
+AM_PROG_AS
+AC_PROG_RANLIB
 
 dnl By default, libtool for mingw refuses to link static libs into a dll for
 dnl fear of mixing pic/non-pic objects, and import/export complications. Since
@@ -572,6 +577,71 @@ if test x$TARGET_OS != xwindows; then
   # All windows code is PIC, forcing it on just adds useless compile warnings
   AX_CHECK_COMPILE_FLAG([-fPIC],[PIC_FLAGS="-fPIC"])
 fi
+
+dnl ---------------------------------------------------------------------------
+dnl RandomX (vendored as a git submodule in src/randomx)
+dnl
+dnl RandomX is built as part of this autotools tree (no nested CMake). Its
+dnl sources are compiled into the convenience library librandomx.a with their
+dnl own compiler flags, mirroring the (conditional) source selection and the
+dnl per-source flags of RandomX's own CMakeLists.txt.
+dnl
+dnl The upstream CMake build adds -maes to the whole library and -mssse3 /
+dnl -mavx2 to argon2_ssse3.c / argon2_avx2.c only. RandomX selects between the
+dnl portable and the SIMD Argon2 implementations at runtime (randomx.cpp), so
+dnl the SIMD flags must NOT leak into the rest of the library.
+dnl ---------------------------------------------------------------------------
+AC_ARG_WITH([randomx],
+  [AS_HELP_STRING([--without-randomx],
+  [do not build the vendored RandomX library (default=auto, i.e. build it on supported hosts)])],
+  [with_randomx=$withval],
+  [with_randomx=auto])
+
+RANDOMX_ARCH=none
+case $host in
+  x86_64-*|amd64-*)
+    RANDOMX_ARCH=x86_64
+    ;;
+  aarch64-*|arm64-*)
+    RANDOMX_ARCH=aarch64
+    ;;
+esac
+
+build_randomx=no
+if test "x$with_randomx" != xno; then
+  if test "x$RANDOMX_ARCH" = xnone; then
+    if test "x$with_randomx" = xyes; then
+      AC_MSG_ERROR([--with-randomx was given but host $host is not supported by RandomX (x86_64 or aarch64 required)])
+    fi
+    AC_MSG_WARN([host $host is not supported by RandomX; building without it])
+  elif test ! -f "$srcdir/src/randomx/src/randomx.cpp"; then
+    if test "x$with_randomx" = xyes; then
+      AC_MSG_ERROR([src/randomx is empty. Run: git submodule update --init --recursive])
+    fi
+    AC_MSG_WARN([src/randomx is not checked out; building without RandomX. Run: git submodule update --init --recursive])
+  else
+    build_randomx=yes
+  fi
+fi
+
+RANDOMX_AES_CFLAGS=
+RANDOMX_SSSE3_CFLAGS=
+RANDOMX_AVX2_CFLAGS=
+if test x$build_randomx = xyes; then
+  if test "x$RANDOMX_ARCH" = xx86_64; then
+    AX_CHECK_COMPILE_FLAG([-maes],[RANDOMX_AES_CFLAGS="-maes"],[],[$CXXFLAG_WERROR])
+    AX_CHECK_COMPILE_FLAG([-mssse3],[RANDOMX_SSSE3_CFLAGS="-mssse3"],[],[$CXXFLAG_WERROR])
+    AX_CHECK_COMPILE_FLAG([-mavx2],[RANDOMX_AVX2_CFLAGS="-mavx2"],[],[$CXXFLAG_WERROR])
+  fi
+fi
+
+AC_SUBST(RANDOMX_ARCH)
+AC_SUBST(RANDOMX_AES_CFLAGS)
+AC_SUBST(RANDOMX_SSSE3_CFLAGS)
+AC_SUBST(RANDOMX_AVX2_CFLAGS)
+AM_CONDITIONAL([USE_RANDOMX],[test x$build_randomx = xyes])
+AM_CONDITIONAL([RANDOMX_X86_64],[test "x$RANDOMX_ARCH" = xx86_64])
+AM_CONDITIONAL([RANDOMX_AARCH64],[test "x$RANDOMX_ARCH" = xaarch64])
 
 if test x$use_hardening != xno; then
   AX_CHECK_COMPILE_FLAG([-Wstack-protector],[HARDENED_CXXFLAGS="$HARDENED_CXXFLAGS -Wstack-protector"])
