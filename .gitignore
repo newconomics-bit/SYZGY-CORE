@@ -59,6 +59,10 @@ src/qt/test/moc*.cpp
 .libs
 .*.swp
 *.*~*
+# autoconf writes dotless backup names such as `configure~` (no dot before the
+# tilde), which the `*.*~*` pattern above cannot match. Ignore them explicitly.
+/configure~
+**/configure~
 *.bak
 *.rej
 *.orig
