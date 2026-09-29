@@ -219,6 +219,12 @@ public:
     uint64_t nNonce64;
     uint256 mix_hash;
 
+    // SYZGY dual-PoW: RandomX (CPU) proof. Persisted so that a node which has restarted
+    // derives exactly the same miner-class statistics as a freshly-synced node. Omitting
+    // these makes LoadBlockIndexGuts restore nulls and breaks Sync Controller determinism.
+    uint64_t nRandomXNonce;
+    uint256  hashRandomX;
+
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     int32_t nSequenceId;
 
@@ -250,6 +256,10 @@ public:
         //KAWPOW
         nNonce64       = 0;
         mix_hash       = uint256();
+
+        //SYZGY RandomX (CPU) proof
+        nRandomXNonce  = 0;
+        hashRandomX    = uint256();
     }
 
     CBlockIndex()
@@ -271,6 +281,10 @@ public:
         nHeight        = block.nHeight;
         nNonce64       = block.nNonce64;
         mix_hash       = block.mix_hash;
+
+        //SYZGY RandomX (CPU) proof
+        nRandomXNonce  = block.nRandomXNonce;
+        hashRandomX    = block.hashRandomX;
 
     }
 
@@ -305,6 +319,8 @@ public:
         block.nHeight        = nHeight;
         block.nNonce64       = nNonce64;
         block.mix_hash       = mix_hash;
+        block.nRandomXNonce  = nRandomXNonce;
+        block.hashRandomX    = hashRandomX;
         return block;
     }
 
@@ -386,6 +402,10 @@ const CBlockIndex* LastCommonAncestor(const CBlockIndex* pa, const CBlockIndex* 
 
 
 /** Used to marshal pointers into hashes for db storage. */
+// SYZGY: the RandomX fields are NOT redeclared here -- CDiskBlockIndex derives from
+// CBlockIndex and would otherwise shadow the base members, so that a copy through a
+// CBlockIndex* (as done by LoadBlockIndexGuts and CChain::Load) would silently drop them.
+// They are inherited and simply serialised below.
 class CDiskBlockIndex : public CBlockIndex
 {
 public:
@@ -431,6 +451,20 @@ public:
             READWRITE(mix_hash);
         }
 
+        // SYZGY dual-PoW: RandomX (CPU) proof. Serialised in the same relative order as
+        // CBlockHeader::SerializationOp (primitives/block.h): after the KawPoW fields.
+        //
+        // ON-DISK FORMAT NOTE: this changes the value layout of the DB_BLOCK_INDEX
+        // (LevelDB 'B' key) records written by CBlockTreeDB::WriteBlockIndex. It is
+        // pre-launch-safe only because SYZGY ships a new chain with a re-mined genesis and
+        // has no pre-existing block index to migrate: a node that already holds an index
+        // written in the old layout fails to reindex (it errors out on reparse) rather
+        // than silently mis-reading the trailing fields. On an established chain this
+        // change would require a database version bump plus an index migration/reindex.
+
+        READWRITE(nRandomXNonce);
+        READWRITE(hashRandomX);
+
     }
 
     uint256 GetBlockHash() const
@@ -446,6 +480,8 @@ public:
         block.nHeight         = nHeight;
         block.nNonce64        = nNonce64;
         block.mix_hash        = mix_hash;
+        block.nRandomXNonce   = nRandomXNonce;
+        block.hashRandomX     = hashRandomX;
         return block.GetHash();
     }
 

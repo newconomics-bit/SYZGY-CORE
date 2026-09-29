@@ -486,6 +486,8 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nTx            = diskindex.nTx;
                 pindexNew->nNonce64       = diskindex.nNonce64;
                 pindexNew->mix_hash       = diskindex.mix_hash;
+                pindexNew->nRandomXNonce  = diskindex.nRandomXNonce;
+                pindexNew->hashRandomX    = diskindex.hashRandomX;
                 pindexNew->nHeight        = diskindex.nHeight;
 
                 if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams))
