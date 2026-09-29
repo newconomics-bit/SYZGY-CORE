@@ -12,6 +12,8 @@
 
 #include <crypto/ethash/include/ethash/progpow.hpp>
 
+#include <syzgy/randomx_glue.h>
+
 //TODO remove these
 double algoHashTotal[16];
 int algoHashHits[16];
@@ -292,3 +294,31 @@ uint256 KAWPOWHash_OnlyMix(const CBlockHeader& blockHeader)
 
 
 
+/**
+ * SYZGY dual-PoW: the RandomX (CPU) half of the block proof (FR-01).
+ *
+ * Both wrappers delegate to syzgy:: in src/syzgy/randomx_glue.cpp and fail CLOSED:
+ * a null uint256 is returned whenever RandomX is unavailable or misconfigured, and
+ * the caller must treat that as a rejected block. There is no opt-out.
+ */
+uint256 RandomXHash(const CBlockHeader& blockHeader, const uint256& seed)
+{
+    uint256 out;
+    std::string strError;
+    if (!syzgy::RandomXHash(blockHeader, seed, out, strError)) {
+        LogPrintf("SYZGY: RandomXHash failed: %s\n", strError);
+        return uint256();
+    }
+    return out;
+}
+
+uint256 RandomXHash_OnlyTemplate(const CBlockHeader& blockHeader)
+{
+    // No active seed yet => null hash. Callers that need a value must first set one
+    // via syzgy::RandomXSetActiveSeed() (or pass the seed to RandomXHash above).
+    const uint256 seed = syzgy::RandomXActiveSeed();
+    if (seed.IsNull()) {
+        return uint256();
+    }
+    return RandomXHash(blockHeader, seed);
+}

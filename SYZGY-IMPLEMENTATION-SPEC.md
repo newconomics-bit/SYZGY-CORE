@@ -17,7 +17,7 @@ These were decided in Q&A with the founder. **Do not revisit without asking.**
 | # | Decision | Rationale |
 |---|----------|-----------|
 | D1 | Single block header carries BOTH proofs: `rx_nonce` + `rx_hash` appended after the existing KawPoW fields. No version gating, no linked-block pair, nothing in the coinbase. | Prefix-compatible append; satisfies FR-01; keeps header-only/SPV validation intact for the light wallet (FR-12). Two linked blocks would break the 60s spacing and halving math at 2,083,333 blocks. |
-| D2 | RandomX = official `monero-project/randomx`, vendored, MIT/BSD. Thin C++ consensus glue. Never a custom implementation, never xmrig. | xmrig is GPLv3 → license contamination of the MIT base, and is miner-side not consensus code. PRD risk mitigation demands a battle-tested base. |
+| D2 | RandomX = official `tevador/RandomX` (mirror `monero-project/randomx`), vendored, **BSD-3-Clause**. Thin C++ consensus glue. Never a custom implementation, never xmrig. | xmrig is GPLv3 → license contamination of the MIT base, and is miner-side not consensus code. PRD risk mitigation demands a battle-tested base. BSD-3-Clause is MIT-compatible (both permissive, notice-retention only), so vendoring it into the MIT base is safe. |
 | D3 | Per-algo difficulty: **LWMA for RandomX/CPU**, **DGW for KawPoW/GPU**, plus a cross-algo **Sync Controller**. Never a single shared target; never DGW on the CPU side. | FR-01 makes both proofs mandatory → block time = slower class. LWMA's fast response suits volatile home-CPU hashrate. |
 | D4 | Single coinbase, consensus-enforced outputs. Founder 1 SYZ is **carved from** the block subsidy, not added on top. | Preserves the ~75M curve; keeps the transparent-UTXO pillar. Separate coinbases are impossible (one coinbase per block); a purely off-chain split would break on-chain vesting. |
 | D5 | Fresh genesis with the manifesto in the coinbase scriptSig, `nTime = 1790514000`, nonce re-mined. No trusted setup. | Fair launch + independent network identity. PoW needs no ceremony. |
@@ -61,7 +61,7 @@ These were decided in Q&A with the founder. **Do not revisit without asking.**
 | `syzgy_subsidy.h/.cpp` | Emission schedule + `CoinbaseSplit` + coinbase validator impl |
 | `syzgy_coinbase.h` | Declaration-only: burn script, founder script, `CheckSyzgyCoinbase` |
 | `syzgy_gentest.cpp` | Standalone genesis re-mining utility |
-| `README.md` | Why the official RandomX library, how to vendor, epoch/anchor rule |
+| `README.md` | Why the official RandomX library, how to vendor, epoch/anchor rule, and its BSD-3-Clause licence (see `doc/randomx.md` and §8.1) |
 
 ### New — pool service `pool/`
 
@@ -346,6 +346,45 @@ reload-from-disk paths.
   the resulting hash** — not consensus critical, safe as a compile-time option.
 - If `SYZGY_HAVE_RANDOMX == 0` every CPU-side verification returns false and the daemon refuses to
   start. **Never fail open.**
+
+### 8.1 Vendored RandomX: licence and pin verification
+
+**Licence — BSD-3-Clause, not dual MIT/BSD.** Verified against the upstream tree at the pinned
+commit, not recalled: `src/randomx/LICENSE` is the *only* licence file, it carries the canonical
+3-clause BSD body, and its two copyright lines are `tevador 2018-2019` and
+`The Monero Project 2014-2019`. There is **no MIT permission grant anywhere in the tree**. (The
+one `Permission is hereby granted` string in the repo is in `vcxproj/h2inc.ps1`, an unrelated MIT
+build helper we do not use.) Monero's *pre-4.0* codebase was dual MIT/BSD, but that is a different
+codebase and does not apply here — do not restate the licence as "MIT/BSD".
+
+BSD-3-Clause **is** MIT-compatible for our purposes: both are permissive and the only obligation is
+retaining the copyright notice and disclaimer, which the submodule checkout plus `doc/randomx.md`
+satisfy. Vendoring it into the MIT base is therefore sound. The xmrig rejection stands unchanged:
+xmrig is GPLv3 and would contaminate the MIT base.
+
+**Pin — verified, keep it.**
+
+| | |
+|---|---|
+| Pinned commit | `7607fb2faed24d5a679e139a9828d194bbc644a4` |
+| Tree hash | `9bf592c6b3241a026f0e35951a1132e2bdbfa421` |
+| Position | tip of `master` in **both** `tevador/RandomX` and the official mirror `monero-project/randomx` — identical tree hash in each |
+| Describe | `v2.0.1-5-g7607fb2` — 5 commits **ahead** of `v2.0.1` (`aaafe71322df6602c21a5c72937ac284724ae561`) |
+| Tagged release? | **No.** The pin is an untagged master commit, deliberately. |
+
+Being ahead of `v2.0.1` is a feature, not drift: the 5 commits include two genuine correctness
+fixes — #340 (incorrect dataset-size read) and #343 (x86 JIT template reads on execute-only
+systems). A tagged `v2.0.1` pin would carry both bugs. The `v1.2.3` tag sits on a divergent v1.x
+branch and is **not** a successor to the v2 line; do not "upgrade" to it.
+
+**Two build facts, now known** (details in `doc/randomx.md`):
+
+* RandomX needs **no generated headers on the GCC path.** The CMake generation step
+  (`vcxproj/h2inc.ps1` → `src/asm/configuration.asm`) exists only on the `if(MSVC)` branch, and
+  `src/randomx_constants.hpp` does not exist at this revision. Everything the assembler needs is
+  committed upstream.
+* `configure.ac` **must** carry `AM_PROG_AS`, because the submodule contributes preprocessed `.S`
+  sources that automake routes through `CCAS`/`CCASFLAGS`.
 
 ---
 

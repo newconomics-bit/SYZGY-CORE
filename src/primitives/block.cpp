@@ -7,6 +7,7 @@
 #include "primitives/block.h"
 
 #include <hash.h>
+#include <streams.h>
 #include "tinyformat.h"
 #include "utilstrencodings.h"
 #include "crypto/common.h"
@@ -96,6 +97,30 @@ uint256 CBlockHeader::GetKAWPOWHeaderHash() const
     CKAWPOWInput input{*this};
 
     return SerializeHash(input);
+}
+
+/**
+ * @brief This takes a block header and serialises the canonical RandomX template
+ * (see CRandomXInput): the KawPoW/GPU side is not part of it, the RandomX nonce is.
+ * @note The result is a SERIALISED IMAGE, not a hash. RandomX hashes arbitrary
+ * length inputs, so the raw template bytes are what gets fed to randomx_calculate_hash().
+ */
+uint256 CBlockHeader::GetRandomXHeaderHash() const
+{
+    CRandomXInput input{*this};
+
+    return SerializeHash(input);
+}
+
+std::vector<unsigned char> GetRandomXTemplateImage(const CBlockHeader& header)
+{
+    CBlockHeader h = header;
+    h.hashRandomX.SetNull();
+
+    CDataStream ss(SER_GETHASH, PROTOCOL_VERSION);
+    ss << CRandomXInput{h};
+
+    return std::vector<unsigned char>(ss.begin(), ss.end());
 }
 
 std::string CBlockHeader::ToString() const

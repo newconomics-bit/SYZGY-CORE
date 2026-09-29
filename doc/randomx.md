@@ -13,11 +13,27 @@ anything written there would be lost on the next `git submodule update`.
 | Upstream URL | <https://github.com/tevador/RandomX> |
 | Vendored at | `src/randomx` (git submodule) |
 | Pinned commit | `7607fb2faed24d5a679e139a9828d194bbc644a4` |
-| Upstream describe | `v2.0.1-5-g7607fb2` (master) |
+| Upstream describe | `v2.0.1-5-g7607fb2` (master) — **not a tagged release**, see below |
 | Fetched with | full clone (not shallow) — all 537 refs present, history is complete |
 
 The canonical upstream is `tevador/RandomX`; `monero-project/randomx` is a mirror of
 the same project. We pin the canonical one.
+
+### Pin verification (recorded 2026-09-29)
+
+The pin was checked against upstream rather than assumed:
+
+* `7607fb2faed24d5a679e139a9828d194bbc644a4` is the tip of `master` in **both** `tevador/RandomX`
+  and the official mirror `monero-project/randomx`, with identical tree hash
+  `9bf592c6b3241a026f0e35951a1132e2bdbfa421`.
+* It is **not a tagged release.** It is 5 commits **ahead** of `v2.0.1`
+  (`aaafe71322df6602c21a5c72937ac284724ae561`), which is why `git describe` reports
+  `v2.0.1-5-g7607fb2`.
+* That lead is deliberate and good: the extra commits include two real correctness fixes — #340
+  (incorrect dataset-size read) and #343 (x86 JIT template reads on execute-only systems). Pinning
+  the `v2.0.1` *tag* instead would ship both bugs.
+* The `v1.2.3` tag is on a divergent v1.x branch and is **not** a successor to the v2 line.
+  Do not "upgrade" the pin to it.
 
 Initialise/update with:
 
@@ -52,8 +68,8 @@ satisfy. Linking RandomX into an MIT work keeps the combined work distributable
 under MIT terms for our own code. Nothing in the licence file was modified.
 
 Note the contrast with **xmrig**, which is GPLv3. Xmrig may never be used as the
-RandomX implementation here: linking a GPLv3 library into an MIT/BSD-3 work would
-impose GPLv3 on the combined binary. Only the official BSD-3-Clause (permissive)
+RandomX implementation here: linking a GPLv3 library into an MIT work would impose
+GPLv3 on the combined binary. Only the official BSD-3-Clause (permissive)
 RandomX is vendored. This is the concrete reason the official library is mandatory
 rather than any RandomX-compatible miner.
 
@@ -80,6 +96,9 @@ RandomX's own `CMakeLists.txt`.
 * `AX_CHECK_COMPILE_FLAG` probes reproduce upstream's `add_flag()`/`check_*_flag()`
   logic and export `RANDOMX_AES_CFLAGS` (`-maes`, x86-64 only),
   `RANDOMX_SSSE3_CFLAGS` (`-mssse3`) and `RANDOMX_AVX2_CFLAGS` (`-mavx2`).
+* `AM_PROG_AS` is **required**, not optional: the submodule contributes preprocessed `.S`
+  sources (`src/jit_compiler_x86_static.S`) and automake routes those through
+  `CCAS`/`CCASFLAGS`. Without the macro the assembly sources are not built correctly.
 
 Flags, and why each is scoped the way it is:
 
@@ -117,6 +136,8 @@ build-time generation in RandomX's CMake is the MSVC/MASM-only rule that runs
 `src/asm/configuration.asm`; it only exists on the `if(MSVC)` branch. The GCC build
 instead assembles `src/jit_compiler_x86_static.S`, which `#include`s the committed
 `src/configuration.h` and the committed `src/asm/*.inc` fragments directly.
+`src/randomx_constants.hpp` **does not exist at this revision**, so there is no
+generated-constant header to produce either.
 
 All of those files are tracked in the upstream git repository, so there is nothing
 to run and nothing to commit on our side:

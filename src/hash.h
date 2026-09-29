@@ -608,6 +608,19 @@ inline uint256 HashX16RV2(const T1 pbegin, const T1 pend, const uint256 PrevBloc
 uint256 KAWPOWHash(const CBlockHeader& blockHeader, uint256& mix_hash);
 uint256 KAWPOWHash_OnlyMix(const CBlockHeader& blockHeader);
 
+/**
+ * SYZGY dual-PoW: the RandomX (CPU) half of the block proof.
+ *
+ * `RandomXHash` is the explicit-seed form used by miners and by epoch-aware
+ * validation. `RandomXHash_OnlyTemplate` uses whatever seed is currently active in
+ * the syzgy:: glue; it returns a NULL uint256 until RandomXInit() and a seed have
+ * been set, so callers that care must check for null.
+ *
+ * Both FAIL CLOSED: any RandomX unavailability yields a null uint256 rather than a
+ * fabricated value. There is no way to disable this.
+ */
+uint256 RandomXHash(const CBlockHeader& blockHeader, const uint256& seed);
+uint256 RandomXHash_OnlyTemplate(const CBlockHeader& blockHeader);
 
 #endif // RAVEN_HASH_H
 

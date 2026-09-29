@@ -214,6 +214,7 @@ RAVEN_CORE_H = \
   script/ismine.h \
   streams.h \
   support/allocators/secure.h \
+  syzgy/randomx_glue.h \
   support/allocators/zeroafterfree.h \
   support/cleanse.h \
   support/events.h \
@@ -441,7 +442,7 @@ crypto_libraven_crypto_a_SOURCES += crypto/sha256_sse4.cpp
 endif
 
 # consensus: shared between all executables that validate any consensus rules.
-libraven_consensus_a_CPPFLAGS = $(AM_CPPFLAGS) $(RAVEN_INCLUDES)
+libraven_consensus_a_CPPFLAGS = $(AM_CPPFLAGS) $(RAVEN_INCLUDES) $(RANDOMX_INCLUDES)
 libraven_consensus_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libraven_consensus_a_SOURCES = \
   amount.h \
@@ -460,6 +461,7 @@ libraven_consensus_a_SOURCES = \
   primitives/transaction.h \
   pubkey.cpp \
   pubkey.h \
+  syzgy/randomx_glue.cpp \
   script/ravenconsensus.cpp \
   script/interpreter.cpp \
   script/interpreter.h \
@@ -542,7 +544,7 @@ nodist_libraven_util_a_SOURCES = $(srcdir)/obj/build.h
 
 # ravend binary #
 ravend_SOURCES = ravend.cpp
-ravend_CPPFLAGS = $(AM_CPPFLAGS) $(RAVEN_INCLUDES)
+ravend_CPPFLAGS = $(AM_CPPFLAGS) $(RAVEN_INCLUDES) $(RANDOMX_INCLUDES)
 ravend_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 ravend_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS)
 
@@ -568,6 +570,10 @@ ravend_LDADD += $(BOOST_LIBS) $(BDB_LIBS) $(SSL_LIBS) $(CRYPTO_LIBS) $(MINIUPNPC
 
 if USE_RANDOMX
 ravend_LDADD += $(LIBRANDOMX)
+# Pulls the vendored librandomx.a members into the daemon. The RandomX C entry
+# points are referenced weakly from syzgy/randomx_glue.cpp, which on its own would
+# never cause the archive to be opened; see src/syzgy/randomx_anchor.cpp.
+ravend_SOURCES += syzgy/randomx_anchor.cpp
 endif
 
 # raven-cli binary #
@@ -621,8 +627,15 @@ endif
 
 libravenconsensus_la_LDFLAGS = $(AM_LDFLAGS) -no-undefined $(RELDFLAGS)
 libravenconsensus_la_LIBADD = $(LIBSECP256K1) $(BOOST_LIBS)
-libravenconsensus_la_CPPFLAGS = $(AM_CPPFLAGS) -I$(builddir)/obj -I$(srcdir)/secp256k1/include -DBUILD_RAVEN_INTERNAL
+libravenconsensus_la_CPPFLAGS = $(AM_CPPFLAGS) -I$(builddir)/obj -I$(srcdir)/secp256k1/include -I$(srcdir)/randomx/src -DBUILD_RAVEN_INTERNAL
 libravenconsensus_la_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+
+# The RandomX C entry points are referenced weakly from syzgy/randomx_glue.cpp. Give
+# the shared library a strong pull of the convenience archive so RandomX is actually
+# available to embedders of libravenconsensus (and not merely fail-closed).
+if USE_RANDOMX
+libravenconsensus_la_LIBADD += $(LIBRANDOMX)
+endif
 
 endif
 #
