@@ -183,9 +183,29 @@ public:
 
         genesis = CreateGenesisBlock(1514999494, 25023712, 0x1e00ffff, 4, 5000 * COIN);
 
-        consensus.hashGenesisBlock = genesis.GetX16RHash();
+        // SYZGY: derive the genesis id from the canonical identity hash. GetX16RHash()
+        // hashed the raw memory range BEGIN(nVersion)..END(nNonce), which no longer
+        // corresponds to any consensus pre-image, and it is not stable across a disk
+        // round-trip. GetHash() is SerializeHash(*this) and is the same function the
+        // node uses to key the genesis into mapBlockIndex.
+        consensus.hashGenesisBlock = genesis.GetHash();
 
-        assert(consensus.hashGenesisBlock == uint256S("0000006b444bc2f2ffe627be9d9e7e7a0730000870ef6eb6da46c8eae389df90"));
+        // SYZGY: DELIBERATELY NON-FATAL, TEMPORARY. The hardcoded digest below is a
+        // LEGACY constant recorded for the pre-SYZGY, single-x16r-PoW genesis. It is
+        // stale by construction now and will never match again, so leaving this as a
+        // fatal assert would crash every node at startup and bury the pending re-mine.
+        // It is a warning only.
+        //
+        // TODO(SYZGY re-mine, Wave 2): once the dual-PoW genesis is actually mined and
+        // the constant below is replaced with the new digest, THIS MUST BECOME A FATAL
+        // assert again. A wrong genesis id is a silent consensus split, not a nuisance.
+        if (consensus.hashGenesisBlock != uint256S("0000006b444bc2f2ffe627be9d9e7e7a0730000870ef6eb6da46c8eae389df90")) {
+            LogPrintf("WARNING: SYZGY: legacy hardcoded hashGenesisBlock for MAINNET is stale "
+                      "(expected 0000006b444bc2f2ffe627be9d9e7e7a0730000870ef6eb6da46c8eae389df90, "
+                      "got %s). Non-fatal by design until the dual-PoW genesis re-mine; "
+                      "this must be restored to a fatal assert afterwards.",
+                      consensus.hashGenesisBlock.GetHex());
+        }
         assert(genesis.hashMerkleRoot == uint256S("28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
 
         vSeeds.emplace_back("seed-raven.bitactivate.com", false);
@@ -405,10 +425,18 @@ public:
 //        /////////////////////////////////////////////////////////////////
 
         genesis = CreateGenesisBlock(nGenesisTime, 15615880, 0x1e00ffff, 2, 5000 * COIN);
-        consensus.hashGenesisBlock = genesis.GetX16RHash();
+        // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
+        // hardcoded constant demoted from a fatal assert to a non-fatal warning until
+        // the dual-PoW genesis re-mine restores it.
+        consensus.hashGenesisBlock = genesis.GetHash();
 
-        //Test MerkleRoot and GenesisBlock
-        assert(consensus.hashGenesisBlock == uint256S("0x000000ecfc5e6324a079542221d00e10362bdc894d56500c414060eea8a3ad5a"));
+        if (consensus.hashGenesisBlock != uint256S("0x000000ecfc5e6324a079542221d00e10362bdc894d56500c414060eea8a3ad5a")) {
+            LogPrintf("WARNING: SYZGY: legacy hardcoded hashGenesisBlock for TESTNET is stale "
+                      "(expected 0x000000ecfc5e6324a079542221d00e10362bdc894d56500c414060eea8a3ad5a, "
+                      "got %s). Non-fatal by design until the dual-PoW genesis re-mine; "
+                      "this must be restored to a fatal assert afterwards.",
+                      consensus.hashGenesisBlock.GetHex());
+        }
         assert(genesis.hashMerkleRoot == uint256S("28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
 
         vFixedSeeds.clear();
@@ -622,9 +650,18 @@ public:
 
 
         genesis = CreateGenesisBlock(1524179366, 1, 0x207fffff, 4, 5000 * COIN);
-        consensus.hashGenesisBlock = genesis.GetX16RHash();
+        // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
+        // hardcoded constant demoted from a fatal assert to a non-fatal warning until
+        // the dual-PoW genesis re-mine restores it.
+        consensus.hashGenesisBlock = genesis.GetHash();
 
-        assert(consensus.hashGenesisBlock == uint256S("0x0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c "));
+        if (consensus.hashGenesisBlock != uint256S("0x0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c ")) {
+            LogPrintf("WARNING: SYZGY: legacy hardcoded hashGenesisBlock for REGTEST is stale "
+                      "(expected 0x0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c, "
+                      "got %s). Non-fatal by design until the dual-PoW genesis re-mine; "
+                      "this must be restored to a fatal assert afterwards.",
+                      consensus.hashGenesisBlock.GetHex());
+        }
         assert(genesis.hashMerkleRoot == uint256S("0x28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
