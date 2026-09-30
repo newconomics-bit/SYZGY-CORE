@@ -335,10 +335,50 @@ reload-from-disk paths.
 ## 8. RandomX epochs
 
 - Epoch `N = height / nSyzgyRandomXEpochLength`.
-- Anchor for epoch `N` is the block at height `N × epochLength - 1` (last block of the previous
-  epoch). For `N == 0` the anchor is the genesis block.
-- Seed = `CHash256(fixed_tag || anchor_hash)`, where the tag is `"SYZGY/randomx/seed/v1"`.
+- Seed = `CHash256(fixed_tag || anchor32)`, where the tag is `"SYZGY/randomx/seed/v1"`.
   Every node derives an identical seed with no consensus chatter.
+- **Anchor for epoch `N > 0`** is the hash of the block at height `N × epochLength - 1`, i.e. the
+  last block of the previous epoch. Unchanged.
+- **Anchor for epoch `0` is the GENESIS MERKLE ROOT, not the genesis block hash:**
+
+  ```
+  seed0 = CHash256("SYZGY/randomx/seed/v1" || genesis.hashMerkleRoot)
+  ```
+
+  **Why the merkle root and not the genesis hash — circularity.** Block identity is
+  `SerializeHash(*this)` over the canonical dual-PoW header, and that header COMMITS to
+  `hashRandomX` (the RandomX proof is a serialised header field). So anchoring epoch 0 on the
+  genesis block hash is a fixed point:
+
+  ```
+  seed0 = f(genesis_hash)
+  genesis_hash = g(header) ⊇ hashRandomX = RandomX(CRandomXInput, seed0)
+  ```
+
+  Grinding `hashRandomX` changes the genesis hash → changes `seed0` → changes every RandomX hash →
+  changes `hashRandomX`. There is no value to search for: it is not merely awkward, it is
+  undefined. The merkle root commits to the genesis coinbase (manifesto, output script) and to
+  nothing in the header's PoW fields — not `nNonce64`/`mix_hash`, not `nRandomXNonce`/`hashRandomX`.
+  It is therefore computable *before* any proof exists, is identical on every node, and closes the
+  loop. Note that `seed0` also does not move when the genesis PoW fields are ground, which is what
+  makes the epoch-0 search well-posed: the RandomX search space is over `nRandomXNonce` only, and
+  the target it must meet is a function of `seed0` alone.
+
+  **FR-01 implication.** FR-01 makes both proofs mandatory from block 0. A genesis block that
+  carries a null `hashRandomX` is *invalid under FR-01* — there is no "genesis is exempt" clause.
+  A non-circular seed0 rule is therefore a PRE-CONDITION for the chain existing at all: without it
+  the genesis block cannot carry a valid RandomX proof, and therefore cannot be mined, and
+  therefore there is no chain to validate. This is the single reason the rule is fixed the way it
+  is.
+
+  **Rejected alternative: computing the genesis hash with `hashRandomX` zeroed** (i.e. defining
+  `seed0` from a "pre-proof" genesis hash). Rejected: it is a special-case pre-image that is
+  correct only for height 0 and wrong for every later block, i.e. it introduces a second, invisible
+  hash rule that an auditor must discover by reading the code rather than the spec. That is the
+  recurring bug class in this codebase — genesis-only special cases that silently diverge from the
+  general rule (the same class as the earlier `ReadBlockFromDisk`/`GetX16RHash` identity bugs).
+  The merkle root needs no special case: it is a *different input*, not a *different hash*, so the
+  single `CHash256(tag || anchor32)` rule stays literally true for every epoch.
 - `nSyzgyRandomXPrepBlocks` (720) of preparation before each switch, so nodes, miners and the pool
   precompute the next dataset without stalling block production. The pool pre-loads the next key
   so O(1) share verification stays fast across the transition.
@@ -477,7 +517,11 @@ env var or flag may change it.
   **differently** (the fields are genuinely committed).
 - `syzgy_randomx_input_is_algo_independent` — `CRandomXInput` and `CKAWPOWInput` serialise the
   **byte-identical** image. This is what makes mandatory pairing meaningful.
-- `syzgy_randomx_epoch_math` — epoch boundaries and the `N*len - 1` anchor rule.
+- `syzgy_randomx_epoch_math` — epoch boundaries and the `N*len - 1` anchor rule for `N > 0`.
+- `syzgy_randomx_epoch0_seed_anchor` — **non-circularity test.** `seed0` derives from the genesis
+  merkle root, and `seed0` is unchanged when `hashRandomX` / `nRandomXNonce` are mutated; also
+  assert `seed0 != DeriveRandomXSeed(genesis.GetHash())` so a regression to the circular rule
+  (or to the zeroed-pre-image variant) fails the suite.
 - `syzgy_sync_mode_router` — all four presence combinations; both-absent must not yield a
   single-algo mode; DUAL_POW always reachable (anti-trap).
 - `syzgy_sync_guardrails` — ±`nSyzgySyncMaxRetargetPercent` bound; absurd input clamped; clamping
