@@ -57,32 +57,48 @@
  *
  *  Step 5 -- TARGET TIMESPAN AND CLAMP.
  *      T_target = M * S
- *      T_actual is clamped into [ T_target/M/3, T_target/M*3 ] = [ S/3, 3S ]  ( [20s, 180s] )
+ *      T_actual is clamped into [ T_target/3, T_target*3 ].
  *      The 3x band is the whole point of the algorithm: it bounds a single retarget's reaction to
- *      a manipulated or wildly stale timestamp.
+ *      a manipulated or wildly stale timestamp, and it is TOTAL-RELATIVE -- the standard
+ *      dark-gravity-style guard band, in the same form the GPU half uses.
  *
- *      >>> OPEN SPEC ISSUE, FLAGGED TO THE FOUNDER, NOT WORKED AROUND HERE. <<<
- *      Note the units. T_actual is a TOTAL window timespan (step 4) and T_target is a total as
- *      well (M * S), so step 6's ratio is dimensionally sound. But the clamp band [T_target/M/3,
- *      T_target/M*3] = [S/3, 3S] is a PER-BLOCK quantity, and it is being applied to a TOTAL.
- *      On a correctly-timed network T_actual ~ M*S is one to two orders of magnitude larger
- *      than 3S, so the upper clamp ALWAYS binds: T_new = T_avg * 3S / (M*S) = T_avg * 3/M.
- *      With the production M = 89 that is T_avg / 29.7 EVERY window -- a monotone collapse of the
- *      CPU target toward zero difficulty, i.e. exactly the sub-second-spam failure mode the
- *      whole freeze/guardrail design exists to prevent (FR-02). The regtest numbers are less
- *      extreme (M = 9 -> T_avg/3) but still a collapse.
- *      This implementation follows the specification LITERALLY, because deviating unilaterally
- *      would put this node's CPU target on a different chain from any other implementation and
- *      silently fork the network. The likely intended band is a fraction of the TOTAL, e.g.
- *      clamp T_actual into [ T_target*3/4, T_target*5/4 ] or [ T_target/M*3, T_target*M*3 ],
- *      which only bites on genuinely anomalous timestamps. That is a consensus-parameter change
- *      and is the founder's call, not this file's.
+ *      >>> DEFECT AND FIX (Wave 2, founder-approved). READ THIS BEFORE CHANGING THE BAND. <<<
+ *      The band used to read [ T_target/M/3, T_target/M*3 ] = [ S/3, 3S ] = [20s, 180s].
+ *      That is a UNITS DEFECT: the numerator is a total (M * S) and the divisor is a per-block
+ *      count, so the band came out with PER-BLOCK units, while T_actual is a TOTAL window
+ *      timespan (step 4). On a correctly-timed network T_actual ~ T_target = M*S, which on
+ *      mainnet (M = 89, S = 60) is 5340s -- about 30x above the 180s ceiling. The upper clamp
+ *      therefore ALWAYS bound, on every window, forever:
+ *
+ *          T_new = T_avg * 3S / (M*S) = T_avg * 3/M = T_avg / 29.7   (mainnet)
+ *          T_new = T_avg / 3                                        (regtest, M = 9)
+ *
+ *      i.e. a monotone collapse of the CPU target toward zero difficulty -- precisely the
+ *      sub-second-block-spam failure FR-02 exists to prevent. Nothing about the network's
+ *      behaviour was required to trigger it; a perfectly timed chain was enough.
+ *
+ *      THE FIX: the band is expressed relative to the TOTAL, [T_target/3, T_target*3], the same
+ *      shape DGW uses on the GPU side. Correct arithmetic, mainnet (T_target = 5340):
+ *          band = [ 5340/3 , 5340*3 ] = [ 1780s , 16020s ]  = [ ~29.7 min , ~4.45 h ]
+ *      A correctly-timed window (5340s) sits INSIDE the band and is untouched; only a window
+ *      that arrived more than 3x faster or more than 3x slower than targeted is pulled to the
+ *      bound. That is exactly the intended behaviour of a guard band, and it is wide enough
+ *      that a genuine multi-fold hashrate change is still tracked (step 6's ratio is computed
+ *      from the real T_actual, not the clamped one) while still bounding a single retarget.
+ *
+ *      This is a consensus change: it alters the CPU target at every height. It was made
+ *      deliberately, on the founder's direction, and it is recorded in
+ *      SYZGY-IMPLEMENTATION-SPEC.md section 6.1 step 5.
  *
  *  Step 6 -- NEW TARGET.
  *      T_new = T_avg * T_actual / T_target
- *      256-bit integer division. If the blocks arrived slower than targeted (T_actual > T_target)
- *      the target value rises, i.e. the difficulty falls, which is correct: lower the target to
- *      make blocks easier.
+ *      Floor division, evaluated as an exact 512-bit intermediate (see MulDivFloor()). The
+ *      naive 256-bit `T_avg * T_actual` wraps for any target near the ceiling -- which is every
+ *      target at genesis, and every target on regtest -- and a wrapped product then divides down
+ *      to a target unrelated to T_avg. The helper agrees with the naive expression bit for bit
+ *      wherever the naive expression does not overflow, so this is a correctness fix only.
+ *      If the blocks arrived slower than targeted (T_actual > T_target) the target value rises,
+ *      i.e. the difficulty falls, which is correct: lower the target to make blocks easier.
  *
  *  Step 7 -- CEILING AND FLOOR.
  *      clamp T_new into [1, L]; return T_new.GetCompact().
@@ -118,6 +134,102 @@ namespace {
 /** Largest sample that may be averaged, as a sanity ceiling on a misconfigured params value. */
 const int64_t LWMA_MAX_SAMPLES = 100000;
 
+/**
+ * Minimal non-negative 512-bit accumulator: exactly as much as the LWMA rule needs, and no more.
+ *
+ * WHY IT IS NEEDED -- steps 3 and 6 of the formula block at the top of this file both form a
+ * value wider than 256 bits, and both wrapped before this type existed. Because `randomxLimit`
+ * on a fresh chain -- and on ALL of regtest -- is 0x7fff...ff, "a target near the ceiling" is
+ * not an edge case, it is the normal state of every chain at low height:
+ *
+ *   step 3: T_avg = sum_i (w_i * t_i) / W, with W = M(M+1)/2 = 45 on regtest. Nine samples at
+ *           the ceiling sum to ~2^260. The 256-bit sum wrapped and the division then produced a
+ *           target with no relation to the samples: an on-time regtest window returned
+ *           0x202d8cc where the correct answer is 0x207fffff.
+ *   step 6: T_new = T_avg * T_actual / T_target. On an on-time window T_actual == T_target, so
+ *           `T_avg * 540` alone wraps at the ceiling and returned 0x1f7956eb.
+ *
+ * Both are pure functions of their inputs and both agree with the naive 256-bit form bit for
+ * bit wherever the naive form does not overflow, so this is a correctness fix, not a retune.
+ * Div() saturates rather than wrapping when the true quotient does not fit in 256 bits; the
+ * only caller clamps to bnLimit immediately afterwards, and saturating is the correct direction
+ * there -- a quotient above the ceiling must become the ceiling, never wrap back to a small one.
+ */
+struct UInt512 {
+    arith_uint256 hi;   // bits 256..511
+    arith_uint256 lo;   // bits 0..255
+
+    UInt512() : hi(0), lo(0) {}
+
+    /** A += b. Caller must bound the running total so that `hi` itself cannot overflow. */
+    void Add256(const arith_uint256& b)
+    {
+        const arith_uint256 loSum = lo + b;
+        const uint64_t carry = (loSum < lo) ? 1 : 0;   // the low addition wrapped
+        lo = loSum;
+        hi += arith_uint256(carry);
+    }
+
+    /** A += x * m, for any uint64 m. `x` may be the full 256 bits.
+     *
+     *  x*m = xl*m + (xh*m)*2^128 with xh, xl < 2^128, so each partial product is < 2^192 and
+     *  fits in a 256-bit limb. The `(xh*m)` term straddles the accumulator's 128-bit mark: its
+     *  low 128 bits are added at offset 128 inside `lo` (which carries into `hi` automatically)
+     *  and its high bits go straight into `hi`.
+     */
+    void AddMul(const arith_uint256& x, uint64_t m)
+    {
+        const arith_uint256 kShifted1 = arith_uint256(1) << 128;
+        const arith_uint256 kMask = kShifted1 - arith_uint256(1);
+        const arith_uint256 xh = x >> 128;        // < 2^128
+        const arith_uint256 xl = x & kMask;       // < 2^128
+        const arith_uint256 bnM = m;
+        const arith_uint256 p0 = xl * bnM;        // < 2^192
+        const arith_uint256 p1 = xh * bnM;        // < 2^192
+        Add256(p0);
+        Add256((p1 & kMask) << 128);
+        hi += (p1 >> 128);                        // < 2^64
+    }
+
+    /** floor(A / b) for b > 0. Saturates at 2^256-1 if the quotient does not fit. */
+    arith_uint256 Div(uint64_t b) const
+    {
+        const arith_uint256 bnB = b;
+        const arith_uint256 kShifted1 = arith_uint256(1) << 128;
+        const arith_uint256 kMask = kShifted1 - arith_uint256(1);
+
+        // Long division of A = hi*2^256 + lo by b, in 128-bit-scaled steps so that no
+        // intermediate exceeds 256 bits. Each `r` is < b, so each `r << 128` stays inside.
+        const arith_uint256 q2 = hi / bnB;
+        const arith_uint256 r2 = hi - q2 * bnB;              // < b
+
+        const arith_uint256 loHi = lo >> 128;
+        const arith_uint256 loLo = lo & kMask;
+
+        const arith_uint256 t = (r2 << 128) + loHi;          // <= b*2^128 - 1
+        const arith_uint256 q1 = t / bnB;                    // <= 2^128 - 1
+        const arith_uint256 r1 = t - q1 * bnB;               // < b
+
+        const arith_uint256 rem2 = (r1 << 128) + loLo;       // <= b*2^128 - 1
+        const arith_uint256 q0 = rem2 / bnB;                 // <= 2^128 - 1
+
+        // The quotient is q2*2^256 + q1*2^128 + q0. A non-zero q2 means it is >= 2^256 and
+        // cannot be represented; q1 and q0 are both bounded by 2^128-1 by construction above.
+        if (q2 != arith_uint256(0)) {
+            return arith_uint256(~arith_uint256(0));
+        }
+        return arith_uint256((q1 << 128) + q0);
+    }
+};
+
+/** floor(x * a / b), evaluated in 512 bits so the intermediate product cannot wrap. b > 0. */
+arith_uint256 MulDivFloor(const arith_uint256& x, uint64_t a, uint64_t b)
+{
+    UInt512 acc;
+    acc.AddMul(x, a);
+    return acc.Div(b);
+}
+
 } // namespace
 
 unsigned int CalculateLWMANextWorkRequired(const arith_uint256& bnPastTargetAvg,
@@ -136,25 +248,33 @@ unsigned int CalculateLWMANextWorkRequired(const arith_uint256& bnPastTargetAvg,
         return bnPastTargetAvg.GetCompact();
     }
 
-    // Step 5: T_target / M == S exactly, because T_target was built as M * S. A non-positive
-    // value here means S <= 0, which the nTargetTimespan check above already excludes.
-    const int64_t nAvgBlockTime = nTargetTimespan / nPastBlocks;
-    if (nAvgBlockTime <= 0) {
+    // Step 5: the guard band is TOTAL-RELATIVE, [T_target/3, T_target*3] -- the same shape the
+    // GPU half (Dark Gravity Wave) uses. See the DEFECT AND FIX block in the header comment:
+    // the previous band, [T_target/M/3, T_target/M*3] = [S/3, 3S], was a per-block quantity
+    // applied to a total-window quantity, so its upper bound always bound and collapsed the
+    // target toward zero difficulty on a correctly-timed network.
+    //
+    // Guard the arithmetic: a misconfigured S large enough to overflow T_target*3 must hold
+    // rather than wrap into a negative band.
+    if (nTargetTimespan > ((int64_t)1 << 62) / 3) {
         return bnPastTargetAvg.GetCompact();
     }
-    const int64_t nMinTimespan = nAvgBlockTime / 3;
-    const int64_t nMaxTimespan = nAvgBlockTime * 3;
+    const int64_t nMinTimespan = nTargetTimespan / 3;
+    const int64_t nMaxTimespan = nTargetTimespan * 3;
+    if (nMinTimespan <= 0) {
+        return bnPastTargetAvg.GetCompact();
+    }
     if (nActualTimespan < nMinTimespan) nActualTimespan = nMinTimespan;
     if (nActualTimespan > nMaxTimespan) nActualTimespan = nMaxTimespan;
 
     // A weighted average of in-range samples cannot exceed the ceiling. Enforcing it here as
-    // well keeps the step-6 multiply inside 256 bits for any bnLimit.
+    // well keeps the value the step-6 multiply starts from inside [0, bnLimit].
     arith_uint256 bnAvg = bnPastTargetAvg;
     if (bnAvg > bnLimit) bnAvg = bnLimit;
 
-    // Step 6.
-    arith_uint256 bnNew = (bnAvg * arith_uint256((uint64_t)nActualTimespan)) /
-                          arith_uint256((uint64_t)nTargetTimespan);
+    // Step 6, evaluated through the 512-bit helper: T_new = T_avg * T_actual / T_target.
+    arith_uint256 bnNew =
+        MulDivFloor(bnAvg, (uint64_t)nActualTimespan, (uint64_t)nTargetTimespan);
 
     // Step 7.
     if (bnNew == arith_uint256(0)) bnNew = arith_uint256(1);
@@ -189,7 +309,10 @@ unsigned int GetNextRandomXWorkRequired(const CBlockIndex* pindexLast,
         return bnLimit.GetCompact();
     }
 
-    arith_uint256 bnWeightedSum = arith_uint256(0);
+    // Step 3 accumulates in 512 bits: W samples of a target that may be as large as the
+    // ceiling produce a sum wider than 256 bits, and a wrapped sum silently returns a target
+    // unrelated to the window. See UInt512.
+    UInt512 accWeightedSum;
     const CBlockIndex* pindex = pindexLast;
     for (int64_t i = 1; i <= nPastBlocks; ++i) {
         bool fNegative = false;
@@ -199,7 +322,7 @@ unsigned int GetNextRandomXWorkRequired(const CBlockIndex* pindexLast,
         if (fNegative || fOverflow) bnTarget = bnLimit;
 
         const int64_t nWeight = (nPastBlocks + 1) - i; // w_i, heaviest on the tip
-        bnWeightedSum += bnTarget * arith_uint256((uint64_t)nWeight);
+        accWeightedSum.AddMul(bnTarget, (uint64_t)nWeight);
 
         // The i-th sample is B_i, at height (tipHeight - i + 1), so i = M lands on
         // height (tipHeight - M + 1). Never walked off the start: pindexLast->nHeight >= M
@@ -221,7 +344,7 @@ unsigned int GetNextRandomXWorkRequired(const CBlockIndex* pindexLast,
     }
     pindex = pindex->pprev;
 
-    const arith_uint256 bnPastTargetAvg = bnWeightedSum / arith_uint256((uint64_t)nWeightSum);
+    const arith_uint256 bnPastTargetAvg = accWeightedSum.Div((uint64_t)nWeightSum);
 
     // Step 4. pindexLast is B_1, pindex is B_{M+1}.
     const int64_t nActualTimespan =

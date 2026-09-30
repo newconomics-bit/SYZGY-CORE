@@ -154,25 +154,30 @@ BOOST_AUTO_TEST_CASE(syzgy_lwma_bootstrap)
     // the answer is no longer forced to the ceiling. Asserted against the reference value
     // computed from the spec's own formulas.
     //
-    // NOTE ON THE GUARD BAND. Step 5 clamps the TOTAL window timespan into [S/3, 3S] = [20, 180]
-    // seconds. A 9-block window at a correct 60s spacing spans 9*60 = 540s, which is ABOVE 180,
-    // so the clamp binds and pulls T_actual down to 180. That is what the specification as
-    // written says to do, and this implementation follows it literally rather than silently
-    // rescaling the band. The consequence (the band is a per-block quantity applied to a
-    // total-window quantity, so on a correctly-timed network T_actual is always clamped to 3S)
-    // is flagged to the founder as a units defect in the spec, not worked around here: changing
-    // it unilaterally would fork the CPU target away from any other implementation.
+    // NOTE ON THE GUARD BAND. Step 5 clamps the TOTAL window timespan into [T_target/3,
+    // T_target*3], i.e. TOTAL-relative (mainnet: [1780s, 16020s]). This chain is on time, so
+    // T_actual = 9 * 60 = 540 = T_target exactly, which sits INSIDE the band and is not
+    // touched; T_new = T_avg * T_target / T_target = T_avg. That is the whole point of the
+    // corrected band: a correctly-timed chain must reproduce its own average target, not a
+    // fraction of it. See syzgy_lwma_target_does_not_collapse below.
+    //
+    // The chain below is built at HARD_BITS rather than at the ceiling, so that "the answer is
+    // no longer the ceiling" is a statement with teeth: on regtest randomxLimit's own compact
+    // form IS 0x207fffff, so an EASY_BITS chain would prove nothing.
     const Consensus::Params rp = params;
     const int64_t nM = rp.nSyzgySyncWindow - 1;
     const int64_t nT = nM * rp.nSyzgySyncTargetBlockSeconds;
     const unsigned int kAtBoundary = syzgy::CalculateLWMANextWorkRequired(
-        arith_uint256().SetCompact(EASY_BITS), nM, 3 * rp.nSyzgySyncTargetBlockSeconds, nT,
+        arith_uint256().SetCompact(HARD_BITS), nM, nT, nT,
         UintToArith256(rp.randomxLimit));
-    BuiltChain* bc2 = BuildChain(9, EASY_BITS, 1000000, 60, true, true);
+    BuiltChain* bc2 = BuildChain(9, HARD_BITS, 1000000, 60, true, true);
     BOOST_CHECK_MESSAGE(syzgy::GetNextRandomXWorkRequired(bc2->tip(), nullptr, params) == kAtBoundary,
         "at exactly tip->nHeight == M the window walk must run and produce the spec-derived "
         "target (got " << syzgy::GetNextRandomXWorkRequired(bc2->tip(), nullptr, params)
         << ", expected " << kAtBoundary << ")");
+    BOOST_CHECK_MESSAGE(kAtBoundary == HARD_BITS,
+        "an on-time window must leave the target exactly where the window average already had "
+        "it, got " << kAtBoundary << " expected " << HARD_BITS);
     BOOST_CHECK_MESSAGE(kAtBoundary != kLimitCompact,
         "just past the bootstrap boundary the answer must stop being the ceiling, otherwise the "
         "boundary check above proves nothing");
@@ -241,18 +246,37 @@ BOOST_AUTO_TEST_CASE(syzgy_lwma_clamps_absurd_timespan)
     const Consensus::Params params = RegtestParams();   // S = 60, window 10, M = 9
     const int64_t M = params.nSyzgySyncWindow - 1;
     const int64_t S = params.nSyzgySyncTargetBlockSeconds;
-    const int64_t nTarget = M * S;                      // 540
+    const int64_t nTarget = M * S;                      // T_target = 540
+    // Step 5's band, TOTAL-relative: [T_target/3, T_target*3] = [180, 1620] seconds of TOTAL
+    // window time. Regtest deliberately uses a tiny window, so 3x is reached at 180s spacing.
+    const int64_t nBandLo = nTarget / 3;
+    const int64_t nBandHi = nTarget * 3;
 
-    // Reference answer: the target that the 3x guard band produces. This is derived straight
-    // from the spec's step 5/step 6 and is computed by the same function, so it checks that
-    // the clamp is applied rather than that the clamp is numerically correct.
+    // Reference answer: the target that the upper guard band produces, derived straight from
+    // spec steps 5/6 -- T_actual pulled back to 3*T_target, so T_new = T_avg * 3.
     const arith_uint256 bnAvg = arith_uint256().SetCompact(HARD_BITS);
     const arith_uint256 bnLimit = arith_uint256().SetCompact(EASY_BITS);
-    const unsigned int kExpected = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, 3 * S, nTarget, bnLimit);
+    const unsigned int kExpected =
+        syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nBandHi, nTarget, bnLimit);
+    const unsigned int kExpectedLow =
+        syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nBandLo, nTarget, bnLimit);
 
-    // End to end: blocks 10x slower than target. Raw T_actual = 10 * nTarget = 5400, which is
-    // far outside the [S/3, 3S] = [20, 180] band and must be pulled back to 180.
-    BuiltChain* slow = BuildChain(14, HARD_BITS, 1700000000, 600, true, true);
+    // Sanity on the band edges themselves: inside the band the arithmetic is exact, so a 2x-slow
+    // window yields exactly twice the average.
+    {
+        const unsigned int k2x = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, 2 * nTarget, nTarget, bnLimit);
+        const arith_uint256 want = arith_uint256().SetCompact(arith_uint256(bnAvg * arith_uint256((uint64_t)2)).GetCompact());
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(k2x) == want,
+            "a 2x-slow window lies inside the band and must be tracked exactly (got "
+                << arith_uint256().SetCompact(k2x).GetHex() << " want " << want.GetHex() << ")");
+        BOOST_CHECK_MESSAGE(nBandHi == 1620 && nBandLo == 180,
+            "the regtest guard band must be [180, 1620] seconds of total window time, got ["
+                << nBandLo << ", " << nBandHi << "]");
+    }
+
+    // End to end: blocks 10x slower than target. Raw T_actual = 10 * T_target = 5400, which is
+    // above the 1620s ceiling and must be pulled back to exactly T_target*3.
+    BuiltChain* slow = BuildChain(14, HARD_BITS, 1700000000, 10 * S, true, true);
     const unsigned int uSlow = syzgy::GetNextRandomXWorkRequired(slow->tip(), nullptr, params);
     BOOST_CHECK_MESSAGE(uSlow == kExpected,
         "a 10x-slow window must clamp to the 3x guard band (got " << uSlow
@@ -264,14 +288,13 @@ BOOST_AUTO_TEST_CASE(syzgy_lwma_clamps_absurd_timespan)
     BOOST_CHECK_MESSAGE(uEdge == kExpected,
         "an exactly-3x window is the clamp boundary and must match the clamped 10x window");
 
-    // And the low side: the guard band is [S/3, 3S] = [20, 180] seconds of TOTAL window time.
-    // A 14-block window at 1s per block spans 14s, which is under the 20s floor and must be
-    // pulled up to exactly S/3.
-    const unsigned int kExpectedLow = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, S / 3, nTarget, bnLimit);
+    // And the low side: the guard band floor is T_target/3 = 180 seconds of TOTAL window time.
+    // A 14-block window at 1s per block spans 9s over the averaged samples, which is under the
+    // floor and must be pulled up to exactly T_target/3.
     BuiltChain* fast = BuildChain(14, HARD_BITS, 1700000000, 1, true, true);
     const unsigned int uFast = syzgy::GetNextRandomXWorkRequired(fast->tip(), nullptr, params);
     BOOST_CHECK_MESSAGE(uFast == kExpectedLow,
-        "a window far faster than target must clamp to the S/3 guard band (got " << uFast
+        "a window far faster than target must clamp to the T_target/3 guard band (got " << uFast
             << ", expected " << kExpectedLow << ")");
     BOOST_CHECK_MESSAGE(kExpectedLow != kExpected,
         "the low and high clamp bands must produce different targets, otherwise this test is "
@@ -282,9 +305,221 @@ BOOST_AUTO_TEST_CASE(syzgy_lwma_clamps_absurd_timespan)
     delete fast;
 }
 
-// ===========================================================================================
+// -------------------------------------------------------------------------------------------
+// REGRESSION: the step-5 units defect. Before the fix the band was [T_target/M/3, T_target/M*3]
+// = [S/3, 3S] -- a PER-BLOCK bound applied to the TOTAL window timespan -- so its upper bound
+// always bound and every window returned T_avg * 3/M, ratcheting the CPU target toward zero
+// difficulty. These two tests are the lock on the fix.
+// -------------------------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(syzgy_lwma_target_does_not_collapse)
+{
+    // THE FR-02 TEST. A chain whose blocks arrive exactly on time must keep its target, window
+    // after window, forever. Under the defective band the answer was T_avg/3 for regtest and
+    // T_avg/29.7 for mainnet on EVERY window, so this chain would slide toward zero difficulty
+    // with no misbehaviour on the network's part at all.
+    const Consensus::Params params = RegtestParams();
+    const int64_t S = params.nSyzgySyncTargetBlockSeconds;
+    const int64_t M = params.nSyzgySyncWindow - 1;
+    const int64_t nTarget = M * S;
+
+    // 40 windows' worth of history, every block exactly S apart and every nBits identical, so the
+    // weighted average T_avg is exactly SetCompact(HARD_BITS) throughout and the only thing that
+    // can move the answer is the clamp.
+    BuiltChain* bc = BuildChain(4 * (int)M, HARD_BITS, 1700000000, S, true, true);
+
+    unsigned int prev = HARD_BITS;
+    const arith_uint256 bnPrev = arith_uint256().SetCompact(HARD_BITS);
+    const arith_uint256 bnLimit = UintToArith256(params.randomxLimit);
+    for (int h = (int)M; h <= 4 * (int)M; ++h) {
+        const unsigned int next = syzgy::GetNextRandomXWorkRequired(bc->blocks[h], nullptr, params);
+        // Exact: an on-time window has T_actual == T_target, so step 6's ratio is exactly 1 and
+        // the target comes back exactly where the window average already had it.
+        BOOST_CHECK_MESSAGE(next == prev,
+            "an on-time chain must not ratchet its target at height " << h << " (got 0x"
+                << std::hex << next << ", previous 0x" << prev << std::dec << ")");
+        // And a tolerance-style statement of the same thing, so the intent survives any future
+        // re-derivation of the exact values: never more than 1% away from the previous target.
+        const arith_uint256 bn = arith_uint256().SetCompact(next);
+        BOOST_CHECK_MESSAGE(bn * arith_uint256((uint64_t)100) >= bnPrev * arith_uint256((uint64_t)99)
+                                && bn * arith_uint256((uint64_t)100) <= bnPrev * arith_uint256((uint64_t)101),
+            "an on-time chain must keep the target within 1% of the previous one, moved "
+                << bnPrev.GetHex() << " -> " << bn.GetHex());
+        BOOST_CHECK_MESSAGE(bn <= bnLimit, "the target must never exceed randomxLimit");
+        prev = next;
+    }
+
+    // The step that would have collapsed it, spelled out: on-time must equal the raw average,
+    // not average/M * 3.
+    BOOST_CHECK_MESSAGE(prev == HARD_BITS,
+        "after 4 windows an on-time chain must still sit exactly on its window average, got "
+            << std::hex << prev << " expected " << HARD_BITS << std::dec);
+    BOOST_CHECK_MESSAGE(nTarget == 540,
+        "this test's arithmetic assumes regtest T_target == 540, got " << nTarget);
+
+    delete bc;
+}
+
+BOOST_AUTO_TEST_CASE(syzgy_lwma_tracks_genuine_3x_hashrance)
+{
+    // The other side of the same fix: the band must not be so WIDE that it ignores real
+    // difficulty movement, nor so TIGHT that it breaks FR-02 (blocks pinned to 60s).
+    //
+    // A 3x hashrate change means blocks arrive 3x faster, i.e. every S/3 seconds, so
+    // T_actual = M*(S/3) = T_target/3 -- which is exactly the band's LOWER BOUND. Step 6 then
+    // divides by 3 and the difficulty genuinely triples. Nothing is clamped away.
+    const Consensus::Params params = RegtestParams();
+    const int64_t S = params.nSyzgySyncTargetBlockSeconds;
+    const int64_t M = params.nSyzgySyncWindow - 1;
+    const int64_t nTarget = M * S;
+    const int64_t nThird = S / 3;               // per-block time at 3x hashrate
+    const int64_t nThirdTotal = M * nThird;     // M*(S/3) = T_target/3, the band's lower bound
+    const arith_uint256 bnAvg = arith_uint256().SetCompact(HARD_BITS);
+    const arith_uint256 bnLimit = UintToArith256(params.randomxLimit);
+
+    // 3x hashrate IN: block time S/3 = 20s, T_actual = 180 = T_target/3.
+    {
+        const unsigned int got = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nThirdTotal, nTarget, bnLimit);
+        // GetCompact() drops the low mantissa bits, so the comparison is made through a round
+        // trip on both sides: an assertion about the arithmetic, not about mantissa truncation.
+        const arith_uint256 want = arith_uint256().SetCompact(arith_uint256(bnAvg / arith_uint256((uint64_t)3)).GetCompact());
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(got) == want,
+            "a genuine 3x hashrate increase must triple the difficulty exactly (got "
+                << arith_uint256().SetCompact(got).GetHex() << " want " << want.GetHex() << ")");
+        BOOST_CHECK_MESSAGE(got < HARD_BITS,
+            "a 3x hashrate increase must move the target toward zero difficulty (FR-02, harder "
+            "is fine) -- got 0x" << std::hex << got << " from 0x" << HARD_BITS << std::dec);
+    }
+
+    // 3x hashrate OUT: block time 3S = 180s, T_actual = 1620 = T_target*3.
+    {
+        const unsigned int got = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nTarget * 3, nTarget, bnLimit);
+        const arith_uint256 want = arith_uint256().SetCompact(arith_uint256(bnAvg * arith_uint256((uint64_t)3)).GetCompact());
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(got) == want,
+            "a genuine 3x hashrate drop must divide the difficulty by 3 exactly (got "
+                << arith_uint256().SetCompact(got).GetHex() << " want " << want.GetHex() << ")");
+        BOOST_CHECK_MESSAGE(got > HARD_BITS,
+            "a 3x hashrate drop must move the target toward zero difficulty (FR-02) -- got 0x"
+                << std::hex << got << " from 0x" << HARD_BITS << std::dec);
+    }
+
+    // Same thing end to end through the index walk, so the clamp is exercised on real B_k data
+    // rather than on the raw arithmetic.
+    {
+        BuiltChain* faster = BuildChain(14, HARD_BITS, 1700000000, nThird, true, true);
+        const unsigned int uFaster =
+            syzgy::GetNextRandomXWorkRequired(faster->tip(), nullptr, params);
+        const unsigned int wantFaster =
+            syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nThirdTotal, nTarget, bnLimit);
+        BOOST_CHECK_MESSAGE(uFaster == wantFaster,
+            "end to end: a chain at S/3 spacing must land exactly on the T_target/3 bound (got 0x"
+                << std::hex << uFaster << ", expected 0x" << wantFaster << std::dec << ")");
+        BOOST_CHECK_MESSAGE(uFaster < HARD_BITS,
+            "end to end: a 3x-faster chain must not be frozen at the previous target");
+        delete faster;
+    }
+    {
+        BuiltChain* slower = BuildChain(14, HARD_BITS, 1700000000, 3 * S, true, true);
+        const unsigned int uSlower =
+            syzgy::GetNextRandomXWorkRequired(slower->tip(), nullptr, params);
+        const unsigned int wantSlower =
+            syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nTarget * 3, nTarget, bnLimit);
+        BOOST_CHECK_MESSAGE(uSlower == wantSlower,
+            "end to end: a chain at 3S spacing must land exactly on the 3*T_target bound (got 0x"
+                << std::hex << uSlower << ", expected 0x" << wantSlower << std::dec << ")");
+        BOOST_CHECK_MESSAGE(uSlower > HARD_BITS,
+            "end to end: a 3x-slower chain must raise the difficulty, i.e. lower the target value "
+            "toward zero difficulty without being clamped flat");
+        delete slower;
+    }
+
+    // NOT too tight: an on-time chain (T_actual == T_target) must be left completely alone --
+    // a band tighter than [T_target/3, 3*T_target] would already have begun distorting it.
+    {
+        BuiltChain* onTime = BuildChain(14, HARD_BITS, 1700000000, S, true, true);
+        BOOST_CHECK_MESSAGE(syzgy::GetNextRandomXWorkRequired(onTime->tip(), nullptr, params) == HARD_BITS,
+            "an on-time chain must be left exactly untouched by the guard band");
+        delete onTime;
+    }
+
+    // And the band's own limits: 4x slower is outside the band and must be pinned to the bound
+    // rather than followed, which is what bounds a single retarget's reaction to a stale chain.
+    {
+        const unsigned int got = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nTarget * 4, nTarget, bnLimit);
+        const unsigned int atBound = syzgy::CalculateLWMANextWorkRequired(bnAvg, M, nTarget * 3, nTarget, bnLimit);
+        BOOST_CHECK_MESSAGE(got == atBound,
+            "a 4x-slow window must be pinned to the 3x bound, not followed to 4x");
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// REGRESSION: two 256-bit overflows in the LWMA arithmetic itself (steps 3 and 6). Both are
+// reachable in normal operation, because randomxLimit on a fresh chain -- and on ALL of regtest
+// -- is 0x7fff...ff, so "a target near the ceiling" is the normal state at low height, not an
+// edge case.
+// -------------------------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(syzgy_lwma_arithmetic_does_not_overflow_at_the_ceiling)
+{
+    const Consensus::Params params = RegtestParams();
+
+    // STEP 3. The weighted sum of nine ceiling-valued samples is ~2^260 and wrapped mod 2^256,
+    // which made an on-time window at the ceiling return 0x202d8cc instead of the ceiling itself.
+    // kCeiling is regtest randomxLimit's compact form; a chain sitting exactly on it must come
+    // back exactly on it.
+    const unsigned int kCeiling = UintToArith256(params.randomxLimit).GetCompact();
+    BOOST_REQUIRE_MESSAGE(kCeiling == EASY_BITS,
+        "this test assumes regtest randomxLimit compact == 0x207fffff, got " << kCeiling);
+    {
+        BuiltChain* atCeiling = BuildChain(9, EASY_BITS, 1000000, 60, true, true);
+        const unsigned int got = syzgy::GetNextRandomXWorkRequired(atCeiling->tip(), nullptr, params);
+        BOOST_CHECK_MESSAGE(got == EASY_BITS,
+            "STEP 3 OVERFLOW: an on-time window whose every sample is the ceiling must return the "
+            "ceiling, got " << std::hex << got << " expected 0x" << EASY_BITS << std::dec
+            << " (0x202d8cc here is the signature of the wrapped weighted sum)");
+        delete atCeiling;
+    }
+
+    // STEP 6. `T_avg * T_actual` alone exceeds 256 bits at the ceiling even when T_actual ==
+    // T_target, i.e. when the retarget is a no-op. The exact quotient must be T_avg itself.
+    {
+        const arith_uint256 bnCeiling = UintToArith256(params.randomxLimit);
+        const int64_t nT = 540;                       // M * S on regtest
+        const unsigned int got = syzgy::CalculateLWMANextWorkRequired(
+            bnCeiling, 9, nT, nT, bnCeiling);
+        // Compared in COMPACT space: GetCompact() is a lossy encoding, so the round trip of the
+        // exact 2^256-1 is not 2^256-1. The assertion is that the function returns precisely the
+        // compact form of its own input, with no arithmetic at all done to it.
+        const unsigned int want = bnCeiling.GetCompact();
+        BOOST_CHECK_MESSAGE(got == want,
+            "STEP 6 OVERFLOW: T_new = T_avg * T_target / T_target must be exactly T_avg, got "
+                << std::hex << got << " want " << want << std::dec
+                << " (0x1f7956eb here is the signature of the wrapped multiply)");
+    }
+
+    // AND the helper must be a fix, not a retune: wherever the naive 256-bit expression does
+    // not overflow, the two agree bit for bit. HARD_BITS is far enough below the ceiling for
+    // every product here to fit.
+    {
+        const arith_uint256 bnAvg = arith_uint256().SetCompact(HARD_BITS);
+        const arith_uint256 bnLimit = UintToArith256(params.randomxLimit);
+        const int64_t ratios[] = {180, 200, 540, 900, 1500, 1620};
+        for (size_t i = 0; i < sizeof(ratios) / sizeof(ratios[0]); ++i) {
+            const int64_t t = ratios[i];
+            const unsigned int got = syzgy::CalculateLWMANextWorkRequired(bnAvg, 9, t, 540, bnLimit);
+            const unsigned int naive = arith_uint256(
+                (bnAvg * arith_uint256((uint64_t)t)) / arith_uint256((uint64_t)540)).GetCompact();
+            BOOST_CHECK_MESSAGE(got == naive,
+                "the 512-bit step 6 must agree with the naive 256-bit expression wherever that "
+                    "one does not overflow (T_actual=" << t << ", got 0x" << std::hex << got
+                    << ", naive 0x" << naive << std::dec << ")");
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // Sync Controller
-// ===========================================================================================
+// -------------------------------------------------------------------------------------------
 
 BOOST_AUTO_TEST_CASE(syzgy_sync_freezes_absent_class)
 {

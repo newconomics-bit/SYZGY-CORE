@@ -188,14 +188,45 @@ derivation load-bearing rather than cosmetic.
 1. `tip == null || tip->nHeight < M` → `L.GetCompact()` (bootstrap).
 2. Weights `w_i = (M+1) - i` for `i = 1..M` (oldest sample excluded — LWMA-2 convention);
    `W = M(M+1)/2`.
-3. `T_avg = Σ w_i · SetCompact(B_i.nBits) / W`.
+3. `T_avg = Σ w_i · SetCompact(B_i.nBits) / W`, accumulated and divided in an exact 512-bit
+   intermediate (a 256-bit accumulator wraps: `W` ceiling-valued samples sum to ~2^260).
 4. `T_actual = B_1.nTime - B_{M+1}.nTime`.
-5. `T_target = M · S`; clamp `T_actual` to `[T_target/M/3, T_target/M·3]` = `[20s, 180s]`.
-6. `T_new = T_avg · T_actual / T_target` (256-bit integer division).
+5. `T_target = M · S`; clamp `T_actual` to `[T_target/3, T_target·3]`, **total-relative**.
+6. `T_new = T_avg · T_actual / T_target`, evaluated in the same exact 512-bit intermediate
+   (`T_avg · T_actual` exceeds 256 bits at the ceiling, i.e. always at genesis and on regtest).
 7. Clamp `1 <= T_new <= L`. Return `T_new.GetCompact()`.
 8. Degenerate (`M<1`, `T_target<=0`, or `T_actual==0` pre-clamp) → return `T_avg.GetCompact()` (hold).
 
 Pure function of the index chain. No wall clock, no statics. `pblock` is deliberately unread.
+
+#### Defect and fix — step 5 guard band (Wave 2)
+
+The band in step 5 originally read `[T_target/M/3, T_target/M·3]` = `[S/3, 3S]` = `[20s, 180s]`.
+That is a **units defect**: `T_actual` (step 4) and `T_target` are both *total window* quantities,
+but dividing by `M` turns the bound into a *per-block* quantity. On a correctly-timed network
+`T_actual ≈ T_target = M·S`, which on mainnet is `89 · 60 = 5340s` — ~30× above the 180s ceiling.
+The upper clamp therefore bound on **every** window, unconditionally, with no misbehaviour on the
+network's part:
+
+```
+T_new = T_avg · 3S / (M·S) = T_avg · 3/M = T_avg / 29.7   (mainnet, M = 89)
+T_new = T_avg / 3                                        (regtest, M = 9)
+```
+
+i.e. a monotone collapse of the RandomX/CPU target toward zero difficulty — exactly the
+sub-second-block-spam failure FR-02 exists to prevent, and the single largest latent consensus
+bug in Wave 1.
+
+**Fix (founder-approved direction, Wave 2):** express the band relative to the *total*,
+`[T_target/3, T_target·3]` — the standard dark-gravity-style guard band and the same shape the
+GPU half already uses in §6.2. Mainnet arithmetic: `T_target = 5340`, band
+`[1780s, 16020s]` = `[~29.7 min, ~4.45 h]`. A correctly-timed window sits inside the band
+untouched; only a window more than 3× faster or slower than targeted is pulled to the bound.
+This is a hard-fork consensus change and is deliberate; it was flagged by the Wave 2A
+implementation against the literal spec and resolved by the founder. Two regression tests lock it
+in: `syzgy_lwma_target_does_not_collapse` (on-time blocks keep the bits near the previous bits
+instead of ratcheting down) and `syzgy_lwma_tracks_genuine_3x_hashrance` (a real 3× hashrate
+change is still followed, so the band is not too wide to be useless).
 
 ### 6.2 DGW (KawPoW / GPU)
 

@@ -47,6 +47,14 @@ unsigned int GetNextRandomXWorkRequired(const CBlockIndex* pindexLast,
  * @param nTargetTimespan  T_target -- M * S, the seconds those M samples should have taken.
  * @param bnLimit          L      -- the per-algorithm target ceiling (params.randomxLimit).
  * @return the new target, already clamped to [1, L], in compact form.
+ *
+ * THE STEP-5 GUARD BAND IS [nTargetTimespan/3, nTargetTimespan*3] -- TOTAL-relative, i.e.
+ * relative to the TOTAL window timespan T_target, NOT to a per-block figure. The earlier band
+ * [T_target/M/3, T_target/M*3] = [S/3, 3S] mixed units (per-block bound applied to a total),
+ * so its upper bound always bound on a correctly-timed chain and drove the CPU target down by
+ * a factor of M/3 every window -- the FR-02 collapse. Fixed on the founder's direction; see
+ * the DEFECT AND FIX block at the top of syzgy_lwma.cpp and section 6.1 step 5 of
+ * SYZGY-IMPLEMENTATION-SPEC.md.
  */
 unsigned int CalculateLWMANextWorkRequired(const arith_uint256& bnPastTargetAvg,
                                            int64_t nPastBlocks, int64_t nActualTimespan,
