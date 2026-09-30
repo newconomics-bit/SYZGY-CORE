@@ -22,6 +22,7 @@
 #include "pow.h"
 #include "primitives/transaction.h"
 #include "script/standard.h"
+#include "syzgy/randomx_glue.h"
 #include "timedata.h"
 #include "txmempool.h"
 #include "util.h"
@@ -190,6 +191,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     pblock->nNonce         = 0;
     pblock->nNonce64         = 0;
+    pblock->nRandomXNonce  = 0;   // SYZGY: CPU-side search space, see RavenMiner below
     pblock->nHeight          = nHeight;
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
 
@@ -627,47 +629,117 @@ void static RavenMiner(const CChainParams& chainparams)
             //
             int64_t nStart = GetTime();
             arith_uint256 hashTarget = arith_uint256().SetCompact(pblock->nBits);
+            // SYZGY: dual proof is only required at or after the KawPoW activation.
+            // Before it, GetHashFull() is a single x16r/x16rv2 hash whose pre-image
+            // genuinely contains the 32-bit nNonce, so the legacy single-nonce grind
+            // below is still correct and is deliberately retained.
+            //
+            // COST WARNING: a full dual-proof generate is MUCH heavier than the old
+            // single-nonce loop. Every candidate now needs a KawPoW proof AND a RandomX
+            // proof over the same template, and RandomX is orders of magnitude slower per
+            // hash than the GPU-side KawPoW. Expect generate/regtest block production to
+            // slow down by a large factor.
+            //
+            // TODO(SYZGY Wave 2, Sync Controller): the loop below satisfies BOTH proofs at
+            // the SAME target (nBits), which is the conservative and correct default but
+            // is not what we want long term. Wave 2's Sync Controller must govern
+            // per-algorithm targets -- allocating a defined share of total difficulty to
+            // the GPU proof and a defined share to the CPU proof -- so that neither side
+            // can be starved or can unilaterally dominate the chain's real hash rate.
+            const bool fDualProof = (pblock->nTime >= nKAWPOWActivationTime);
+            // RandomX seed for the CPU half of the proof. Derived deterministically from
+            // the chain; see syzgy::DeriveRandomXSeed().
+            const uint256 randomXSeed = syzgy::RandomXActiveSeed();
+            if (fDualProof && !syzgy::RandomXIsAvailable())
+                LogPrintf("RavenMiner: WARNING: RandomX unavailable, CPU half of the dual proof "
+                          "cannot be computed; the RandomX half will be treated as unsatisfied "
+                          "until initialisation succeeds\n");
             while (true)
             {
 
                 uint256 hash;
                 uint256 mix_hash;
-                while (true)
-                {
-                    hash = pblock->GetHashFull(mix_hash);
-                    if (UintToArith256(hash) <= hashTarget)
-                    {
-                        pblock->mix_hash = mix_hash;
-                        // Found a solution
-                        SetThreadPriority(THREAD_PRIORITY_NORMAL);
-                        LogPrintf("RavenMiner:\n  proof-of-work found\n  hash: %s\n  target: %s\n", hash.GetHex(), hashTarget.GetHex());
-                        ProcessBlockFound(pblock, chainparams);
-                        SetThreadPriority(THREAD_PRIORITY_LOWEST);
-                        coinbaseScript->KeepScript();
+                // ---- KawPoW / legacy x16r half: driven by nNonce64 (or nNonce pre-KAWPOW)
+                hash = pblock->GetHashFull(mix_hash);
+                const bool fKawPoWSatisfied = (UintToArith256(hash) <= hashTarget);
 
-                        // In regression test mode, stop mining after a block is found. This
-                        // allows developers to controllably generate a block on demand.
-                        if (chainparams.MineBlocksOnDemand())
-                            throw boost::thread_interrupted();
-
-                        break;
+                // ---- RandomX (CPU) half: driven by nRandomXNonce, mandatory pairing (FR-01)
+                bool fRandomXSatisfied = true;
+                if (fDualProof) {
+                    uint256 randomXHash;
+                    std::string strRandomXError;
+                    if (syzgy::RandomXHash(*pblock, randomXSeed, randomXHash, strRandomXError)) {
+                        // Commit the proof output into the header: the block identity is
+                        // SerializeHash(*this), so hashRandomX is part of what gets hashed.
+                        pblock->hashRandomX = randomXHash;
+                        fRandomXSatisfied = (UintToArith256(randomXHash) <= hashTarget);
+                    } else {
+                        fRandomXSatisfied = false;
+                        LogPrintf("RavenMiner: RandomXHash failed: %s\n", strRandomXError);
                     }
+                }
+
+                nHashesDone += 1;
+
+                if (fKawPoWSatisfied && fRandomXSatisfied)
+                {
+                    pblock->mix_hash = mix_hash;
+                    // Found a solution
+                    SetThreadPriority(THREAD_PRIORITY_NORMAL);
+                    LogPrintf("RavenMiner:\n  proof-of-work found\n  hash: %s\n  randomx: %s\n  target: %s\n",
+                              hash.GetHex(), pblock->hashRandomX.GetHex(), hashTarget.GetHex());
+                    ProcessBlockFound(pblock, chainparams);
+                    SetThreadPriority(THREAD_PRIORITY_LOWEST);
+                    coinbaseScript->KeepScript();
+
+                    // In regression test mode, stop mining after a block is found. This
+                    // allows developers to controllably generate a block on demand.
+                    if (chainparams.MineBlocksOnDemand())
+                        throw boost::thread_interrupted();
+
+                    break;
+                }
+
+                // SYZGY: advance the nonce that the failing half is actually keyed on.
+                //   nNonce64       -> the KawPoW proof (GetHashFull recomputes the mix
+                //                     from nHeight / nNonce64 / header hash)
+                //   nRandomXNonce  -> the RandomX proof
+                // Both proofs must pass before either nonce is advanced, so neither
+                // search space can be skipped over.
+                if (fDualProof) {
+                    if (!fKawPoWSatisfied) {
+                        pblock->nNonce64 += 1;
+                        pblock->nRandomXNonce = 0;
+                    } else {
+                        pblock->nRandomXNonce += 1;
+                    }
+                } else {
                     pblock->nNonce += 1;
-                    nHashesDone += 1;
-                    if (nHashesDone % 500000 == 0) {   //Calculate hashing speed
-                        nHashesPerSec = nHashesDone / (((GetTimeMicros() - nMiningTimeStart) / 1000000) + 1);
-                    } 
+                }
+
+                if (nHashesDone % 500000 == 0) {   //Calculate hashing speed
+                    nHashesPerSec = nHashesDone / (((GetTimeMicros() - nMiningTimeStart) / 1000000) + 1);
+                }
+                if (fDualProof) {
+                    if ((pblock->nRandomXNonce & 0xFF) == 0)
+                        break;
+                } else {
                     if ((pblock->nNonce & 0xFF) == 0)
                         break;
                 }
+            }
 
-                // Check for stop or if block needs to be rebuilt
-                boost::this_thread::interruption_point();
-                // Regtest mode doesn't require peers
-                //if (vNodes.empty() && chainparams.MiningRequiresPeers())
-                //    break;
-                if (pblock->nNonce >= 0xffff0000)
-                    break;
+            // Check for stop or if block needs to be rebuilt
+            boost::this_thread::interruption_point();
+            // Regtest mode doesn't require peers
+            //if (vNodes.empty() && chainparams.MiningRequiresPeers())
+            //    break;
+            if (pblock->nNonce >= 0xffff0000)
+                break;
+            // SYZGY: the KawPoW search space is 64-bit, so the legacy 32-bit wrap
+            // sentinel cannot bound it. Bound the dual proof by the CPU nonce instead.
+            if (fDualProof && pblock->nRandomXNonce >= 0xffff0000ULL)
+                break;
                 if (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 60)
                     break;
                 if (pindexPrev != chainActive.Tip())
