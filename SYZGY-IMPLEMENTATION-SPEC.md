@@ -149,16 +149,32 @@ Unconditional, from block 0. **The legacy `if (nTime < nKAWPOWActivationTime)` b
 removed** — a dead path on a pre-launch chain and a consensus-divergence hazard. Do not
 reintroduce it.
 
-**Both** `CKAWPOWInput` and `CRandomXInput` serialise the *same* field set
-(`nVersion, hashPrevBlock, hashMerkleRoot, nTime, nBits, nHeight`) — no nonce fields. This is
-what makes mandatory pairing meaningful: neither algorithm can be satisfied against a different
-header than the other.
+**Both** `CKAWPOWInput` and `CRandomXInput` serialise the *same header field set*
+(`nVersion, hashPrevBlock, hashMerkleRoot, nTime, nBits, nHeight`). This is what makes mandatory
+pairing meaningful: neither algorithm can be satisfied against a different header than the other.
+Each template then adds exactly **one** search field, and they are different fields:
+
+| Template | Field set | Search field |
+|---|---|---|
+| `CKAWPOWInput` | the six header fields | `nNonce64` (+ the `mix_hash` it *produces*) |
+| `CRandomXInput` | the six header fields | `nRandomXNonce` (+ the `hashRandomX` it *produces*) |
+
+Neither template contains its own OUTPUT (`mix_hash` / `hashRandomX`) — including the output
+would be circular. That is why KawPoW is unaffected by the RandomX fields and vice versa:
+changing `nRandomXNonce`/`hashRandomX` cannot invalidate a KawPoW proof, and changing
+`nNonce64`/`mix_hash` cannot invalidate a RandomX proof. Verified, not assumed — see the regtest
+genesis constants in `src/chainparams.cpp`.
+
+**`nBits` is not searchable in either input.** The RandomX search space is `nRandomXNonce` alone,
+so the RandomX half of the genesis is a ground value like any other, obtained by walking
+`nRandomXNonce` against the RandomX target.
 
 `nBits` is the **GPU (KawPoW)** target. The **CPU target is derived** from the index chain, not
 header-committed — a miner must not be able to pick their own CPU target.
 
-**`nBits` is not searchable in the RandomX input.** Consequence: the RandomX half of the genesis
-is a *single deterministic value*, not a search space. Only `nNonce64` (KawPoW) can be ground.
+**Both proofs are mandatory from block 0 (FR-01).** There is no genesis exemption: a genesis
+carrying a null `hashRandomX` is an invalid chain. This is what makes §8's non-circular `seed0`
+derivation load-bearing rather than cosmetic.
 
 ---
 

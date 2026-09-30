@@ -6,6 +6,7 @@
 
 #include "syzgy/syzgy_config.h"
 
+#include "arith_uint256.h"
 #include "crypto/common.h"
 #include "hash.h"
 #include "tinyformat.h"
@@ -392,7 +393,15 @@ bool RandomXCheckProof(const CBlockHeader& header, const uint256& seed, const ui
         return false;
     }
 
-    if (target.IsNull() || target < computed) {
+    // Target test. This MUST go through arith_uint256, never uint256's own operators:
+    // base_blob::Compare() (src/uint256.h) is a raw memcmp() over the LITTLE-ENDIAN byte
+    // array, so `target < computed` compares the LOW bytes first and is NOT a numeric
+    // comparison. With target = 0x7fffff00...00 that test accepted only hashes whose
+    // first byte happened to be small -- it rejected valid proofs at a rate of 255/256,
+    // and would have made the genesis RandomX proof unmineable. Every other PoW site in
+    // the tree (CheckProofOfWork, the miner) already uses UintToArith256 for exactly
+    // this reason. Do not "simplify" this back to a uint256 comparison.
+    if (target.IsNull() || UintToArith256(computed) > UintToArith256(target)) {
         strError = "SYZGY: RandomX proof is above the block target";
         return false;
     }

@@ -764,25 +764,57 @@ public:
         //
         // Verified through the consensus path (GetHashFull + CheckProofOfWork), not just
         // the search loop that produced it.
+        //
+        // KAWPOW DOES NOT DEPEND ON THE RANDOMX FIELDS. CKAWPOWInput
+        // (src/primitives/block.h:229) serialises exactly nVersion, hashPrevBlock,
+        // hashMerkleRoot, nTime, nBits and nHeight -- NOT nRandomXNonce, NOT hashRandomX,
+        // NOT mix_hash (mix_hash is the OUTPUT of KAWPOWHash, src/hash.cpp:277). So setting
+        // the RandomX half below leaves the KawPoW half byte-identical, which was verified
+        // rather than assumed: re-running KAWPOWHash() on the header with the RandomX fields
+        // populated returns the same hash, the same mix_hash and the same
+        // GetKAWPOWHeaderHash() = 54f5ffbe15a13f12015cfcf9ca3c6d7c0e5ec82829d7756ba122d502f36112c8,
+        // and CheckProofOfWork() still passes. No re-grind of nNonce64/mix_hash was needed.
         genesis.nHeight = 0;
         genesis.nNonce64 = 2;
         genesis.mix_hash = uint256S("0x440cf7a9f087a538560ac6195895ec803d169400c06b0d6a9c6685ea108f1bc3");
-        // The RandomX half of the genesis CANNOT be set: the epoch-0 seed is derived from
-        // the genesis block hash (syzgy::DeriveRandomXSeed), and the genesis block hash
-        // commits to hashRandomX, so the seed cannot be known before the proof exists.
-        // nRandomXNonce stays 0 and hashRandomX stays null. No consensus path checks the
-        // RandomX half today (newvld.cpp:1318, newvld.cpp:3992 and txdb.cpp:509 all
-        // verify KawPoW only), so the node starts and validates correctly; the RandomX
-        // half of the genesis remains genuinely unmined pending a non-circular seed rule.
+
+        // SYZGY: the REAL RandomX proof of the regtest genesis -- FR-01 requires both proofs
+        // from block 0, so a null hashRandomX here is an invalid genesis.
+        //
+        // seed0 = CHash256("SYZGY/randomx/seed/v1" || genesis.hashMerkleRoot)
+        //       = c6f5934e928e42bbc9d88cb82122d76499c126def30346cad0be33ef41f95699
+        //
+        // The merkle root -- NOT the genesis block hash -- is the epoch-0 anchor because
+        // block identity is SerializeHash(*this) over this very header, which commits to
+        // hashRandomX: a hash-anchored seed0 is a fixed point. The merkle root commits to the
+        // coinbase only, so seed0 is known before the proof exists, and it does not move
+        // when the PoW fields below are set -- which is what makes this search well-posed.
+        //
+        //   template    = CRandomXInput{nVersion, hashPrevBlock, hashMerkleRoot, nTime,
+        //                                 nBits, nHeight, nRandomXNonce}
+        //   seed        = c6f5934e...95699   (syzgy::RandomXEpoch0Seed)
+        //   nBits       = 0x207fffff  ->  target = 7fffff0000...0000
+        //   E[hits]     = 2^256 / target = 2^24 / (2^27 - 1) = 0.1250000
+        //                 i.e. a mean of one attempt in eight; the search space is
+        //                 nRandomXNonce alone, and only nRandomXNonce is varied.
+        //   result      = 1 hash, 1 attempt (nRandomXNonce 0) -- as the 0.125 predicts.
+        //                 The 78 s of wall clock was the ONE-TIME RandomX dataset build
+        //                 (~2 GiB, SYZGY_RANDOMX_LITE_MODE = 0) inside the first
+        //                 RandomXHash call; the search loop itself ended on hash #1.
+        //
+        //   hashRandomX = 448d4fb0602d16de456deef2a31113559e9d054326662e7f8a0399a0d04cdbd3
+        //
+        // Verified through the real consensus path, syzgy::RandomXCheckProof() against the
+        // real seed0 and the real target: PASS.
         genesis.nRandomXNonce = 0;
-        genesis.hashRandomX.SetNull();
+        genesis.hashRandomX = uint256S("0x448d4fb0602d16de456deef2a31113559e9d054326662e7f8a0399a0d04cdbd3");
 
         // SYZGY: canonical GetHash() over the re-mined dual-PoW genesis. The identity is
         // no longer demoted to a warning -- the re-mined regtest genesis is ground and
         // verified, so a mismatch here is a real consensus split and must be fatal.
         consensus.hashGenesisBlock = genesis.GetHash();
 
-        assert(consensus.hashGenesisBlock == uint256S("0xf0ac1e49f0426693b1011eb3ac54b25d63aa3668ee1466a6c2b8775bff3431e0"));
+        assert(consensus.hashGenesisBlock == uint256S("0x480bbae39f7759fb169b94de23fca696d160f145e8ffa314a7ebe6ffd1409165"));
         assert(genesis.hashMerkleRoot == uint256S("0x400b251fcd8accd5d4d0611e906a46725a861a206e7fb98f33d8895a4a16ce95"));
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
