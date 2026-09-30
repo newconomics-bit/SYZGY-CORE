@@ -73,6 +73,7 @@ RAVEN_TESTS =\
   test/prevector_tests.cpp \
   test/kawpow_tests.cpp \
   test/syzgy_index_tests.cpp \
+  test/syzgy_sync_tests.cpp \
   test/raii_event_tests.cpp \
   test/random_tests.cpp \
   test/reverselock_tests.cpp \
