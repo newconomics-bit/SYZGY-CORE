@@ -22,6 +22,7 @@
 #include "rpc/mining.h"
 #include "rpc/server.h"
 #include "syzgy/randomx_glue.h"
+#include "syzgy/syzgy_sync.h"
 #include "txmempool.h"
 #include "util.h"
 #include "utilstrencodings.h"
@@ -148,13 +149,39 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
         // hash than the GPU-side KawPoW. Expect `generate` / regtest block production
         // to slow down by a large factor.
         //
-        // TODO(SYZGY Wave 2, Sync Controller): this loop satisfies BOTH proofs at the
-        // SAME target (nBits). That is the conservative, correct default, but it is not
-        // the end state. Wave 2's Sync Controller must govern per-algorithm targets,
-        // allocating a defined share of total difficulty to the GPU proof and a defined
-        // share to the CPU proof, so neither side can be starved or dominate.
+        // SYZGY (FR-01, Wave 2): each proof is satisfied against ITS OWN target. The GPU half
+        // answers to the header's nBits; the CPU half answers to the target the Sync Controller
+        // derives from the index, which is deliberately NOT something the header can carry or
+        // choose. The two targets are computed by the same GetNextDualWorkRequired() that
+        // validation calls, so the miner and the validator cannot disagree about what the next
+        // block owes -- a disagreement here does not produce a rejected block, it produces a
+        // chain that cannot be extended past the first retarget.
+        //
+        // This previously satisfied BOTH proofs against nBits, which was correct only while the
+        // CPU target happened to equal the GPU target (i.e. only during the bootstrap window).
+        // Observed on regtest: the chain reached height 10 and then stopped dead with "invalid
+        // RandomX proof at height 11: RandomX proof is above the block target", because the LWMA
+        // window engages at M = nSyzgySyncWindow - 1 and moves the CPU target below nBits.
         const bool fDualProof = (pblock->nTime >= nKAWPOWActivationTime);
         const uint256 randomXSeed = syzgy::RandomXActiveSeed();
+        const Consensus::Params& consensusParams = GetParams().GetConsensus();
+
+        // Which proofs this block actually owes, and the target each one answers to. Resolved
+        // once, before the grind, from the mode the Controller routes for this parent.
+        unsigned int cpuBits = 0, gpuBits = 0;
+        syzgy::SyncMode mode = syzgy::SyncMode::DUAL_POW;
+        if (fDualProof) {
+            // Qualified: pow.h also declares a thin forwarding wrapper, and an unqualified call
+            // with these argument types is ambiguous. The syzgy:: entry point is the
+            // implementation; the wrapper exists only so consensus code has one spelling.
+            syzgy::GetNextDualWorkRequired(chainActive.Tip(), pblock, consensusParams, cpuBits, gpuBits, mode);
+        }
+        const bool fGpuRequired = fDualProof && (mode != syzgy::SyncMode::SINGLE_ALO_CPU);
+        const bool fCpuRequired = fDualProof && (mode != syzgy::SyncMode::SINGLE_ALO_GPU);
+        const uint256 cpuTarget = fCpuRequired
+            ? ArithToUint256(arith_uint256().SetCompact(cpuBits))
+            : uint256();
+
         bool fSolved = false;
         while (nMaxTries > 0 && !fSolved)
         {
@@ -166,21 +193,31 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
                     break;
             }
 
-            // KawPoW / legacy x16r half -- driven by nNonce64 (or nNonce pre-KAWPOW).
+            // KawPoW / legacy x16r half -- driven by nNonce64 (or nNonce pre-KAWPOW). Required in
+            // DUAL_POW and SINGLE_ALO_GPU; not required in SINGLE_ALO_CPU, where the class is
+            // absent and a conforming block carries no mix_hash at all.
             uint256 mix_hash;
-            const bool fKawPoWSatisfied = CheckProofOfWork(pblock->GetHashFull(mix_hash), pblock->nBits,
-                                                          GetParams().GetConsensus());
+            bool fKawPoWSatisfied = true;
+            if (fGpuRequired) {
+                fKawPoWSatisfied = CheckProofOfWork(pblock->GetHashFull(mix_hash), pblock->nBits,
+                                                    consensusParams);
+            }
 
-            // RandomX (CPU) half -- driven by nRandomXNonce, mandatory pairing (FR-01).
+            // RandomX (CPU) half -- driven by nRandomXNonce, against the DERIVED CPU target.
             bool fRandomXSatisfied = true;
-            if (fDualProof) {
+            if (fCpuRequired) {
                 uint256 randomXHash;
                 std::string strRandomXError;
                 if (syzgy::RandomXHash(*pblock, randomXSeed, randomXHash, strRandomXError)) {
                     // hashRandomX is part of SerializeHash(*this), so it is part of the
                     // block identity and must be committed before ProcessNewBlock().
                     pblock->hashRandomX = randomXHash;
-                    fRandomXSatisfied = CheckProofOfWork(randomXHash, pblock->nBits, GetParams().GetConsensus());
+                    // Against the DERIVED CPU target, not nBits. CheckProofOfWork also range-checks
+                    // nBits against params.powLimit, which is the GPU ceiling; the CPU target needs
+                    // its own ceiling (randomxLimit), so the numeric comparison is done here
+                    // through arith_uint256 -- uint256's own operators are a memcmp over the
+                    // little-endian byte array and are NOT numeric.
+                    fRandomXSatisfied = (UintToArith256(randomXHash) <= UintToArith256(cpuTarget));
                 } else {
                     // FAIL CLOSED: no RandomX proof means no solution.
                     fRandomXSatisfied = false;
@@ -192,7 +229,7 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
 
             if (fKawPoWSatisfied && fRandomXSatisfied) {
                 // KAWPOW Assign the mix_hash to the block that was found
-                pblock->mix_hash = mix_hash;
+                if (fGpuRequired) pblock->mix_hash = mix_hash;
                 fSolved = true;
                 break;
             }
