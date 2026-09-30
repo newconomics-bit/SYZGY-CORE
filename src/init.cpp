@@ -21,6 +21,8 @@
 #include "httpserver.h"
 #include "httprpc.h"
 #include "key.h"
+#include "pow.h"
+#include "syzgy/randomx_glue.h"
 #include "validation.h"
 #include "miner.h"
 #include "netbase.h"
@@ -364,6 +366,11 @@ void Shutdown()
     CloseWallets();
  #endif
     globalVerifyHandle.reset();
+    // SYZGY: release the RandomX dataset (~2 GiB in full mode) and every per-thread VM. Without
+    // this the process would hold the dataset until exit; it is also the only thing that makes
+    // RandomXHash()/RandomXCheckProof() fail closed again, which is the documented post-condition
+    // of RandomXShutdown().
+    syzgy::RandomXShutdown();
     ECC_Stop();
     LogPrintf("%s: done\n", __func__);
 }
@@ -1525,6 +1532,45 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)
     LogPrintf("* Using %.1fMiB for chain state database\n", nCoinDBCache * (1.0 / 1024 / 1024));
     LogPrintf("* Using %.1fMiB for in-memory UTXO set (plus up to %.1fMiB of unused mempool space)\n", nCoinCacheUsage * (1.0 / 1024 / 1024), nMempoolSizeMax * (1.0 / 1024 / 1024));
 
+    // SYZGY (FR-01): bring the RandomX (CPU) half of the dual proof online BEFORE the block
+    // index is loaded, because from here on every header this node validates or reads back off
+    // disk must have BOTH proofs checked, and the check fails closed.
+    //
+    // This is deliberately a HARD, UNCONDITIONAL startup step. There is no -disable-randomx, no
+    // "warn and continue", and no fallback: a node that cannot compute a RandomX hash can make
+    // no decision about any SYZGY block, and a node that starts up anyway and then rejects
+    // every block it is offered is strictly worse than one that refuses to start with a
+    // diagnostic. This is the FR-01 fail-closed requirement expressed at process level.
+    {
+        std::string strRandomXError;
+        if (!syzgy::RandomXInit(strRandomXError)) {
+            return InitError(_("SYZGY dual-PoW: RandomX is UNAVAILABLE.") + " " + strRandomXError +
+                             " " + _("FR-01 makes the RandomX (CPU) proof mandatory in every block, "
+                                     "so this node cannot validate or mine a single block without "
+                                     "it. Refusing to start."));
+        }
+
+        // The epoch-0 seed is anchored on the GENESIS MERKLE ROOT and is therefore derivable
+        // before the block index exists -- that non-circularity is the whole point of the
+        // merkle-root anchor (see src/syzgy/randomx_glue.h). Selecting it here also means the
+        // dataset is built once, up front, rather than lazily inside the first header check.
+        const uint256 epoch0Seed = syzgy::RandomXEpoch0Seed(GetParams().GenesisBlock().hashMerkleRoot);
+        if (epoch0Seed.IsNull()) {
+            return InitError(strprintf(_("SYZGY dual-PoW: cannot derive the epoch-0 RandomX seed "
+                                         "from this network's genesis merkle root (%s). Refusing "
+                                         "to start."),
+                                       GetParams().GenesisBlock().hashMerkleRoot.ToString()));
+        }
+        if (!syzgy::RandomXSetActiveSeed(epoch0Seed, strRandomXError)) {
+            return InitError(_("SYZGY dual-PoW: cannot select the epoch-0 RandomX seed.") + " " +
+                             strRandomXError + " " +
+                             _("FR-01 makes the RandomX (CPU) proof mandatory in every block. "
+                               "Refusing to start."));
+        }
+        LogPrintf("SYZGY: RandomX initialised, epoch-0 seed %s (dataset build may take a "
+                  "minute and ~2 GiB in full mode)\n", epoch0Seed.ToString());
+    }
+
     bool fLoaded = false;
     while (!fLoaded && !fRequestShutdown) {
         bool fReset = fReindex;
@@ -1795,6 +1841,32 @@ bool AppInitMain(boost::thread_group& threadGroup, CScheduler& scheduler)
     }
     if (fLoaded) {
         LogPrintf(" block index %15dms\n", GetTimeMillis() - nStart);
+    }
+
+    // SYZGY: the epoch-0 seed selected above is only correct while the tip is in epoch 0. A node
+    // that syncs a chain past an epoch boundary must mine against the CURRENT epoch's seed, or it
+    // would produce blocks no other node can verify. The seed is derived from the chain, so it is
+    // re-derived here once the index exists. Validation never depends on the active seed (it
+    // passes the seed explicitly per height); this is the MINER's seed.
+    if (fLoaded && chainActive.Height() >= 0) {
+        uint256 tipSeed;
+        std::string strTipSeedError;
+        if (GetRandomXSeedForHeight(chainActive.Tip(), GetParams().GetConsensus(), tipSeed,
+                                    strTipSeedError)) {
+            std::string strSetSeedError;
+            if (!syzgy::RandomXSetActiveSeed(tipSeed, strSetSeedError)) {
+                LogPrintf("SYZGY: WARNING: could not select the RandomX seed for the chain tip "
+                          "(height %d): %s. Mining will be unavailable until this succeeds.\n",
+                          chainActive.Height(), strSetSeedError);
+            } else if (tipSeed != syzgy::RandomXEpoch0Seed(GetParams().GenesisBlock().hashMerkleRoot)) {
+                LogPrintf("SYZGY: active RandomX seed %s for the epoch containing height %d\n",
+                          tipSeed.ToString(), chainActive.Height());
+            }
+        } else {
+            LogPrintf("SYZGY: WARNING: could not derive the RandomX seed for the chain tip "
+                      "(height %d): %s. Mining will be unavailable until this succeeds.\n",
+                      chainActive.Height(), strTipSeedError);
+        }
     }
 
     fs::path est_path = GetDataDir() / FEE_ESTIMATES_FILENAME;
