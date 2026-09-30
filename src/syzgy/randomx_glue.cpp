@@ -4,8 +4,11 @@
 
 #include "syzgy/randomx_glue.h"
 
+#include "syzgy/syzgy_config.h"
+
 #include "crypto/common.h"
 #include "hash.h"
+#include "tinyformat.h"
 
 #include <cstring>
 #include <map>
@@ -56,6 +59,14 @@ namespace {
 /** True iff the vendored RandomX library is actually linked into this binary. */
 bool RandomXLibraryPresent()
 {
+    // SYZGY_HAVE_RANDOMX is written by ./configure into syzgy/syzgy_config.h: 1 only
+    // when the vendored submodule was present and librandomx.a is being built. It is a
+    // COMPILE-TIME gate on purpose -- FR-01 makes both proofs mandatory, so "RandomX was
+    // not built" must never compile into a path that quietly skips the RandomX half. A
+    // build without it is fail-closed (every entry point below reports UNAVAILABLE).
+    if (!SYZGY_HAVE_RANDOMX) {
+        return false;
+    }
     return randomx_get_flags != nullptr
         && randomx_alloc_cache != nullptr
         && randomx_init_cache != nullptr
@@ -82,14 +93,15 @@ bool RandomXLibraryPresent()
  *
  * Both modes produce BIT-IDENTICAL hashes -- the mode is a speed/RAM trade-off only
  * and is therefore NOT consensus critical. Select it at build time with
- * -DSYZGY_RANDOMX_LITE_MODE (useful on memory-constrained nodes and CI). There is
+ * --enable-randomx-lite-mode, which sets SYZGY_RANDOMX_LITE_MODE to 1 in
+ * syzgy/syzgy_config.h (useful on memory-constrained nodes and CI). There is
  * intentionally no runtime toggle, so a node's mode cannot change its answers.
  */
-#ifdef SYZGY_RANDOMX_LITE_MODE
-static const bool SYZGY_RANDOMX_LITE = true;
-#else
-static const bool SYZGY_RANDOMX_LITE = false;
+#ifndef SYZGY_RANDOMX_LITE_MODE
+/* Only reachable if someone builds without the generated header; default to full mode. */
+#define SYZGY_RANDOMX_LITE_MODE 0
 #endif
+static const bool SYZGY_RANDOMX_LITE = (SYZGY_RANDOMX_LITE_MODE != 0);
 
 /** Per-seed RandomX state: the cache, plus the dataset in full mode. */
 struct SeedContext {

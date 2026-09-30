@@ -614,9 +614,9 @@ if test "x$with_randomx" != xno; then
       AC_MSG_ERROR([--with-randomx was given but host $host is not supported by RandomX (x86_64 or aarch64 required)])
     fi
     AC_MSG_WARN([host $host is not supported by RandomX; building without it])
-  elif test ! -f "$srcdir/src/randomx/src/randomx.cpp"; then
+  elif test ! -f "$srcdir/src/randomx/src/randomx.cpp" || test ! -f "$srcdir/src/randomx/src/randomx.h"; then
     if test "x$with_randomx" = xyes; then
-      AC_MSG_ERROR([src/randomx is empty. Run: git submodule update --init --recursive])
+      AC_MSG_ERROR([src/randomx is empty (or incomplete). Run: git submodule update --init --recursive])
     fi
     AC_MSG_WARN([src/randomx is not checked out; building without RandomX. Run: git submodule update --init --recursive])
   else
@@ -642,6 +642,39 @@ AC_SUBST(RANDOMX_AVX2_CFLAGS)
 AM_CONDITIONAL([USE_RANDOMX],[test x$build_randomx = xyes])
 AM_CONDITIONAL([RANDOMX_X86_64],[test "x$RANDOMX_ARCH" = xx86_64])
 AM_CONDITIONAL([RANDOMX_AARCH64],[test "x$RANDOMX_ARCH" = xaarch64])
+
+dnl ---------------------------------------------------------------------------
+dnl src/syzgy/syzgy_config.h -- the SYZGY consensus layer's COMPILE-TIME gate.
+dnl
+dnl Deterministic by construction: the value depends only on what is on disk at
+dnl configure time, never on the environment or on a manual post-configure step.
+dnl There is no hand-maintained copy of this file in the tree; `./autogen.sh &&
+dnl ./configure` (or plain `./configure`) is always sufficient to produce it.
+dnl
+dnl SYZGY_HAVE_RANDOMX is 1 iff the vendored RandomX submodule is checked out and is
+dnl therefore being built (see the $build_randomx logic above), else 0. It gates the
+dnl RandomX verification path at COMPILE time, which is what FR-01 (both proofs
+dnl mandatory, no exceptions) needs: a build without RandomX cannot compile a dual
+dnl CheckProofOfWork that quietly skips a proof. It never fails open.
+dnl ---------------------------------------------------------------------------
+AC_ARG_ENABLE([randomx-lite-mode],
+  [AS_HELP_STRING([--enable-randomx-lite-mode],
+  [build RandomX in light mode: cache-only (~256 MiB), slower but low-RAM; produces BIT-IDENTICAL hashes (default=disable)])],
+  [use_randomx_lite_mode=$enableval],
+  [use_randomx_lite_mode=no])
+
+SYZGY_HAVE_RANDOMX_VALUE=0
+if test x$build_randomx = xyes; then
+  SYZGY_HAVE_RANDOMX_VALUE=1
+fi
+
+SYZGY_RANDOMX_LITE_MODE_VALUE=0
+if test "x$use_randomx_lite_mode" = xyes; then
+  SYZGY_RANDOMX_LITE_MODE_VALUE=1
+fi
+
+AC_SUBST([SYZGY_HAVE_RANDOMX], [$SYZGY_HAVE_RANDOMX_VALUE])
+AC_SUBST([SYZGY_RANDOMX_LITE_MODE], [$SYZGY_RANDOMX_LITE_MODE_VALUE])
 
 if test x$use_hardening != xno; then
   AX_CHECK_COMPILE_FLAG([-Wstack-protector],[HARDENED_CXXFLAGS="$HARDENED_CXXFLAGS -Wstack-protector"])
@@ -1340,6 +1373,9 @@ AC_SUBST(ZMQ_LIBS)
 AC_SUBST(PROTOBUF_LIBS)
 AC_SUBST(QR_LIBS)
 AC_CONFIG_FILES([Makefile src/Makefile doc/man/Makefile share/setup.nsi share/qt/Info.plist test/config.ini])
+dnl SYZGY: deterministic compile-time RandomX gate (SYZGY_HAVE_RANDOMX / SYZGY_RANDOMX_LITE_MODE).
+dnl Purely a @VAR@ substitution of syzgy_config.h.in, so it needs no autoheader pass.
+AC_CONFIG_FILES([src/syzgy/syzgy_config.h:src/syzgy/syzgy_config.h.in])
 AC_CONFIG_FILES([contrib/devtools/split-debug.sh],[chmod +x contrib/devtools/split-debug.sh])
 AM_COND_IF([HAVE_DOXYGEN], [AC_CONFIG_FILES([doc/Doxyfile])])
 AC_CONFIG_LINKS([contrib/filter-lcov.py:contrib/filter-lcov.py])
