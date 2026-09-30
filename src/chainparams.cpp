@@ -33,29 +33,69 @@ static const char* const SYZGY_GENESIS_MANIFEST =
 static const uint32_t SYZGY_GENESIS_TIME = 1790514000;
 
 /**
- * SYZGY genesis difficulty: 0x200fff.
+ * SYZGY genesis difficulty.
  *
- * 0x200fff is the EASIEST compact target that CheckProofOfWork() will still accept on
- * mainnet, because it is the largest 0x20xxxx mantissa that stays at or below powLimit
- * (consensus.powLimit == 0x00000fff...ff, whose compact form is 0x20000f). Any
- * mantissa above 0x0fff is rejected by the range check in CheckProofOfWork():
+ * The genesis target is set to exactly powLimit, which is the EASIEST target
+ * CheckProofOfWork() can possibly accept: pow.cpp rejects any nBits whose decoded
+ * target exceeds consensus.powLimit, so this is the floor of the legal range and
+ * nothing easier is representable. Search cost, with the arithmetic:
  *
- *     target(0x200fff) = 0x000fff * 2^232
+ *   target(0x1e0fffff) = 0x00000fffff * 2^216        (exponent 0x1e -> 2^(8*(0x1e-3)))
+ *   E[hits] = 2^256 / target
+ *           = 2^256 / (1048575 * 2^216)
+ *           = 2^40 / 1048575
+ *           = 1048576.5
  *
- * Expected work to satisfy it:
+ * KawPoW runs at millions of H/s, so ~1.05e6 tries is well under a second of GPU work.
+ * RandomX runs at order 100-1000 H/s per core, so ~1.05e6 tries is roughly 20 minutes
+ * to 3 hours of single-core time -- minutes-to-hours, NOT the days a 0x1e00ffff target
+ * (2^32 = 4.3e9 tries) would cost. The genesis is therefore deliberately trivial and the
+ * real difficulty schedule begins immediately afterwards under normal retargeting.
  *
- *     E[hits] = 2^256 / target = 2^256 / (0x000fff * 2^232)
- *             = 2^24 / 4095
- *             = 4096.25...
+ * Regtest uses its own powLimit compact, 0x207fffff, because consensus.powLimit differs
+ * per network and using the mainnet value there would be rejected outright:
  *
- * so ~4096 trials. KawPoW does millions of H/s, so that is sub-millisecond of GPU work.
- * RandomX does order 100-1000 H/s per core, so ~4096 RandomX hashes is roughly 4-40
- * seconds -- seconds, not days. A Bitcoin-style 0x1e00ffff would be 2^32 = 4.3e9 trials
- * and is NOT feasible under RandomX. The genesis is therefore deliberately trivial;
- * real difficulty begins at block 1, where normal retargeting takes over (see the
- * retarget note below and STEP B in the history).
+ *   target(0x207fffff) = 0x7fffff * 2^232
+ *   E[hits] = 2^256 / (8388607 * 2^232) = 2^24 / 8388607 = 2.0000005
+ *
+ * i.e. roughly 2 RandomX hashes, which is what makes the re-mine testable in seconds.
+ *
+ * NOTE: these values were verified against the real arith_uint256 rather than derived
+ * by hand. An earlier draft used 0x200fff, which decodes to 4095 * 2^232 -- about 256x
+ * ABOVE mainnet powLimit -- and CheckProofOfWork() rejects it as out of range.
  */
-static const uint32_t SYZGY_GENESIS_BITS = 0x200fff;
+static const uint32_t SYZGY_GENESIS_BITS = 0x1e0fffff;   // == main/test powLimit compact
+static const uint32_t SYZGY_GENESIS_BITS_REGTEST = 0x207fffff; // == regtest powLimit compact
+
+/**
+ * Does block 1 retarget off the genesis target, or inherit it?
+ *
+ * Read from GetNextWorkRequired() (src/pow.cpp:140) and DarkGravityWave()
+ * (src/pow.cpp:18). This is the recorded answer, not an assumption.
+ *
+ * MAIN/TEST. nDGWActivationBlock = 1, so IsDGWActive(0 + 1) is true and block 1 goes
+ * down the DarkGravityWave() path, not the Bitcoin path. DarkGravityWave() opens with:
+ *
+ *     if (!pindexLast || pindexLast->nHeight < nPastBlocks)   // nPastBlocks = 180
+ *         return bnPowLimit.GetCompact();
+ *
+ * At block 1, pindexLast is the genesis with nHeight == 0, and 0 < 180, so the function
+ * returns powLimit.GetCompact() == 0x1e0fffff -- exactly the genesis nBits.
+ *
+ * So block 1 INHERITS the genesis target rather than retargeting away from it, and that
+ * is correct rather than a defect: the genesis target is already powLimit, the maximum
+ * target the chain can express. There is nothing easier to move to, and the value Dark-
+ * GravityWave() returns IS powLimit. Retargeting begins in earnest at block 181, the
+ * first height whose 180-block window is fully populated; from there the 180-block
+ * moving average of real block times drives nBits. The difficulty schedule is therefore
+ * live from block 181 and the chain is not stuck at a trivial target.
+ *
+ * REGTEST. nDGWActivationBlock is left at 200, so IsDGWActive(1) is false and block 1
+ * takes GetNextWorkRequiredBTC(). fPowNoRetargeting is true for regtest, so
+ * CalculateNextWorkRequired() returns pindexLast->nBits unchanged. Block 1 deliberately
+ * inherits the regtest genesis target. That is the intended regtest behaviour (regtest
+ * is meant to stay at minimum difficulty) and it does not affect main or test.
+ */
 
 //TODO: Take these out
 extern double algoHashTotal[16];
@@ -479,7 +519,7 @@ public:
 
 //        /////////////////////////////////////////////////////////////////
 
-        // SYZGY genesis. Same manifest, own nTime (2026-09-26 09:00:00 UTC) and own
+        // SYZGY genesis. Same manifest, own nTime (2026-09-27 13:00:00 UTC) and own
         // difficulty. The proof fields are filled in by the dual-PoW re-mine.
         genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
         // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
@@ -706,10 +746,11 @@ public:
 //        /////////////////////////////////////////////////////////////////
 
 
-        // SYZGY genesis. Same manifest and own nTime (2026-09-26 09:00:00 UTC). Regtest
-        // uses the same 0x200fff as the other networks so that the dual-PoW genesis proof
-        // is minable in seconds and the re-mine does not have to be repeated per network.
-        genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
+        // SYZGY genesis. Same manifest and own nTime (2026-09-27 13:00:00 UTC). Regtest
+        // gets its own powLimit compact, because consensus.powLimit differs per network
+        // and the mainnet value would be rejected as out of range there.
+        genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS_REGTEST, 4, 5000 * COIN);
+
         // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
         // hardcoded constant demoted from a fatal assert to a non-fatal warning until
         // the dual-PoW genesis re-mine restores it.
