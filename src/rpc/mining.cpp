@@ -21,6 +21,7 @@
 #include "rpc/blockchain.h"
 #include "rpc/mining.h"
 #include "rpc/server.h"
+#include "syzgy/randomx_glue.h"
 #include "txmempool.h"
 #include "util.h"
 #include "utilstrencodings.h"
@@ -136,25 +137,85 @@ UniValue generateBlocks(std::shared_ptr<CReserveScript> coinbaseScript, int nGen
             LOCK(cs_main);
             IncrementExtraNonce(pblock, chainActive.Tip(), nExtraNonce);
         }
-        uint256 mix_hash;
-        while (nMaxTries > 0 && pblock->nNonce < nInnerLoopCount && !CheckProofOfWork(pblock->GetHashFull(mix_hash), pblock->nBits,
-                                                                                      GetParams().GetConsensus())) {
-            if (pblock->nTime < nKAWPOWActivationTime) {
-                ++pblock->nNonce;
-            } else  {
-                ++pblock->nNonce64;
+        // SYZGY: dual proof is only required at or after the KawPoW activation. Before
+        // it, GetHashFull() is a single x16r/x16rv2 hash whose pre-image genuinely
+        // contains the 32-bit nNonce, so the legacy nNonce grind is still correct there
+        // and is deliberately retained.
+        //
+        // COST WARNING: a full dual-proof generate is MUCH heavier than the old
+        // single-nonce loop -- every candidate now needs a KawPoW proof AND a RandomX
+        // proof over the same template, and RandomX is orders of magnitude slower per
+        // hash than the GPU-side KawPoW. Expect `generate` / regtest block production
+        // to slow down by a large factor.
+        //
+        // TODO(SYZGY Wave 2, Sync Controller): this loop satisfies BOTH proofs at the
+        // SAME target (nBits). That is the conservative, correct default, but it is not
+        // the end state. Wave 2's Sync Controller must govern per-algorithm targets,
+        // allocating a defined share of total difficulty to the GPU proof and a defined
+        // share to the CPU proof, so neither side can be starved or dominate.
+        const bool fDualProof = (pblock->nTime >= nKAWPOWActivationTime);
+        const uint256 randomXSeed = syzgy::RandomXActiveSeed();
+        bool fSolved = false;
+        while (nMaxTries > 0 && !fSolved)
+        {
+            if (fDualProof) {
+                if (pblock->nNonce64 >= (uint64_t)nInnerLoopCount || pblock->nRandomXNonce >= (uint64_t)nInnerLoopCount)
+                    break;
+            } else {
+                if (pblock->nNonce >= (uint64_t)nInnerLoopCount)
+                    break;
             }
+
+            // KawPoW / legacy x16r half -- driven by nNonce64 (or nNonce pre-KAWPOW).
+            uint256 mix_hash;
+            const bool fKawPoWSatisfied = CheckProofOfWork(pblock->GetHashFull(mix_hash), pblock->nBits,
+                                                          GetParams().GetConsensus());
+
+            // RandomX (CPU) half -- driven by nRandomXNonce, mandatory pairing (FR-01).
+            bool fRandomXSatisfied = true;
+            if (fDualProof) {
+                uint256 randomXHash;
+                std::string strRandomXError;
+                if (syzgy::RandomXHash(*pblock, randomXSeed, randomXHash, strRandomXError)) {
+                    // hashRandomX is part of SerializeHash(*this), so it is part of the
+                    // block identity and must be committed before ProcessNewBlock().
+                    pblock->hashRandomX = randomXHash;
+                    fRandomXSatisfied = CheckProofOfWork(randomXHash, pblock->nBits, GetParams().GetConsensus());
+                } else {
+                    // FAIL CLOSED: no RandomX proof means no solution.
+                    fRandomXSatisfied = false;
+                    LogPrintf("generate: RandomXHash failed: %s\n", strRandomXError);
+                }
+            }
+
             --nMaxTries;
+
+            if (fKawPoWSatisfied && fRandomXSatisfied) {
+                // KAWPOW Assign the mix_hash to the block that was found
+                pblock->mix_hash = mix_hash;
+                fSolved = true;
+                break;
+            }
+
+            // Advance only the nonce the failing half is keyed on, so neither search
+            // space is skipped over.
+            if (fDualProof) {
+                if (!fKawPoWSatisfied) {
+                    ++pblock->nNonce64;
+                    pblock->nRandomXNonce = 0;
+                } else {
+                    ++pblock->nRandomXNonce;
+                }
+            } else {
+                ++pblock->nNonce;
+            }
         }
-        if (nMaxTries == 0) {
-            break;
-        }
-        if (pblock->nNonce == nInnerLoopCount || pblock->nNonce64 == nInnerLoopCount) {
+        if (!fSolved) {
+            if (nMaxTries == 0) {
+                break;
+            }
             continue;
         }
-
-        // KAWPOW Assign the mix_hash to the block that was found
-        pblock->mix_hash = mix_hash;
 
         std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(*pblock);
         if (!ProcessNewBlock(GetParams(), shared_pblock, true, nullptr))
