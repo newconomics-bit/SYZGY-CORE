@@ -36,25 +36,39 @@ void BlockNetwork::SetNetwork(const std::string& net)
     }
 }
 
+// SYZGY: canonical block identity.
+//
+// The identity hash MUST be a pure function of the SERIALISED header. The previous
+// implementation hashed the raw in-memory byte range BEGIN(nVersion)..END(nNonce), which
+// spans the legacy nNonce field. nNonce is no longer part of SerializationOp (the chain is
+// pre-launch with a re-mined genesis and one fixed dual-PoW layout), it is zeroed by
+// SetNull() and it is never restored on a disk read. A block therefore hashed differently
+// depending on whether it came from the network, the mempool or the block file: the same
+// block had two identities, ReadBlockFromDisk disagreed with mapBlockIndex, ConnectTip
+// treated the block as PoW-invalid and AbortNode killed the process.
+//
+// SerializeHash(*this) commits to the canonical dual-PoW serialisation: nVersion,
+// hashPrevBlock, hashMerkleRoot, nTime, nBits, nHeight, nNonce64, mix_hash,
+// nRandomXNonce and hashRandomX. It is stable across memory and disk images, and because it
+// commits to BOTH proof outputs (mix_hash and hashRandomX) two different valid solutions to
+// the same template cannot collapse onto one mapBlockIndex key -- which is the property
+// dual-PoW mandatory pairing (FR-01) requires.
 uint256 CBlockHeader::GetHash() const
 {
-    if (nTime < nKAWPOWActivationTime) {
-        uint32_t nTimeToUse = MAINNET_X16RV2ACTIVATIONTIME;
-        if (bNetwork.fOnTestnet) {
-            nTimeToUse = TESTNET_X16RV2ACTIVATIONTIME;
-        } else if (bNetwork.fOnRegtest) {
-            nTimeToUse = REGTEST_X16RV2ACTIVATIONTIME;
-        }
-        if (nTime >= nTimeToUse) {
-            return HashX16RV2(BEGIN(nVersion), END(nNonce), hashPrevBlock);
-        }
-
-        return HashX16R(BEGIN(nVersion), END(nNonce), hashPrevBlock);
-    } else {
-        return KAWPOWHash_OnlyMix(*this);
-    }
+    return SerializeHash(*this);
 }
 
+// Proof-of-work hash. This is a DIFFERENT quantity from the block identity returned by
+// GetHash(): the identity commits to the two proof outputs, while this recomputes one proof
+// from the inputs. Callers must pass the claimed mix_hash in; for the KawPoW branch the mix
+// is recomputed from the header (nHeight / nNonce64 / header hash) rather than trusted, so
+// this is strictly stronger than the old KAWPOWHash_OnlyMix() path GetHash() used to take.
+//
+// NOTE (SYZGY): the pre-KAWPOW branches below hash the raw range BEGIN(nVersion)..END(nNonce).
+// That is intentional and NOT the identity bug: x16r / x16rv2 are real single-hash proof
+// algorithms whose pre-image genuinely includes the 32-bit nNonce. It is the pre-re-mine
+// legacy path only and is retained until the dual-PoW re-mine moves the chain past
+// nKAWPOWActivationTime.
 uint256 CBlockHeader::GetHashFull(uint256& mix_hash) const
 {
     if (nTime < nKAWPOWActivationTime) {
@@ -77,6 +91,16 @@ uint256 CBlockHeader::GetHashFull(uint256& mix_hash) const
 
 
 
+// ---------------------------------------------------------------------------
+// LEGACY / NON-CONSENSUS -- DO NOT USE FOR BLOCK IDENTITY OR BLOCK LOOKUP.
+//
+// These two helpers hash the raw memory range BEGIN(nVersion)..END(nNonce) and are retained
+// ONLY so that the historical x16r / x16rv2 genesis digests stay reproducible for diagnostics
+// and migration tooling. They are NOT stable across a disk round-trip (nNonce is not
+// serialised and is never restored on read), so nothing on a consensus path may call them.
+// Consensus identity is CBlockHeader::GetHash(); the proof check is
+// CBlockHeader::GetHashFull(mix_hash). Removing them is Wave 2 cleanup.
+// ---------------------------------------------------------------------------
 uint256 CBlockHeader::GetX16RHash() const
 {
     return HashX16R(BEGIN(nVersion), END(nNonce), hashPrevBlock);
