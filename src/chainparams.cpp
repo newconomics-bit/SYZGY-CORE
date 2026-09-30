@@ -211,7 +211,24 @@ public:
         consensus.nSegwitEnabled = true;
         consensus.nCSVEnabled = true;
         consensus.powLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        consensus.kawpowLimit = uint256S("0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff"); // Estimated starting diff for first 180 kawpow blocks
+        // SYZGY: a fresh chain starts BOTH miner classes at the easiest legal target, so the two
+        // sides begin balanced at the same difficulty. kawpowLimit and randomxLimit are the
+        // per-algorithm ceilings (GPU and CPU respectively) and are deliberately identical here:
+        // they are separate fields because they diverge as each side retargets independently.
+        consensus.kawpowLimit  = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.randomxLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.nSyzgyGpuRewardPercent  = 60;
+        consensus.nSyzgyCpuRewardPercent  = 40;
+        consensus.nSyzgyTailEmission         = 50000000;    // 0.5 SYZ
+        consensus.nSyzgyTailEmissionThreshold = 1 * 100000000; // 1 SYZ
+        consensus.nSyzgyRandomXEpochLength = 129600;        // ~2 months @ 60s
+        consensus.nSyzgyRandomXPrepBlocks  = 720;           // dataset prep window before each switch
+        consensus.nSyzgySyncWindow = 90;                    // LWMA / Data Feed window, in blocks
+        consensus.nSyzgySyncTargetBlockSeconds = 60;
+        consensus.nSyzgySyncMinRatio = 15;                  // percent; also drives the recovery hysteresis
+        consensus.nSyzgySyncMaxRetargetPercent = 60;        // guardrail, in target space
+        consensus.nSyzgyPairingStallBlocks = 6;             // emergency-mode trigger
+        consensus.nMaxFutureBlockTime = 15 * 60;            // FR-04
         consensus.nPowTargetTimespan = 2016 * 60; // 1.4 days
         consensus.nPowTargetSpacing = 1 * 60;
 		consensus.fPowAllowMinDifficultyBlocks = false;
@@ -409,7 +426,20 @@ public:
         consensus.nCSVEnabled = true;
 
         consensus.powLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        consensus.kawpowLimit = uint256S("000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.kawpowLimit  = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.randomxLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.nSyzgyGpuRewardPercent  = 60;
+        consensus.nSyzgyCpuRewardPercent  = 40;
+        consensus.nSyzgyTailEmission         = 50000000;
+        consensus.nSyzgyTailEmissionThreshold = 1 * 100000000;
+        consensus.nSyzgyRandomXEpochLength = 129600;
+        consensus.nSyzgyRandomXPrepBlocks  = 720;
+        consensus.nSyzgySyncWindow = 90;
+        consensus.nSyzgySyncTargetBlockSeconds = 60;
+        consensus.nSyzgySyncMinRatio = 15;
+        consensus.nSyzgySyncMaxRetargetPercent = 60;
+        consensus.nSyzgyPairingStallBlocks = 6;
+        consensus.nMaxFutureBlockTime = 15 * 60;
         consensus.nPowTargetTimespan = 2016 * 60; // 1.4 days
         consensus.nPowTargetSpacing = 1 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true;
@@ -638,7 +668,24 @@ public:
         consensus.nCSVEnabled = true;
         consensus.nSubsidyHalvingInterval = 150;
         consensus.powLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        consensus.kawpowLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.kawpowLimit  = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.randomxLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.nSyzgyGpuRewardPercent  = 60;
+        consensus.nSyzgyCpuRewardPercent  = 40;
+        consensus.nSyzgyTailEmission         = 50000000;
+        consensus.nSyzgyTailEmissionThreshold = 1 * 100000000;
+        // REGTEST uses deliberately SHORT windows and thresholds. With the production values
+        // (a 90-block window, a 6-slot stall threshold, a 129600-block epoch) none of the dual-PoW
+        // machinery -- epoch switching, emergency mode, the recovery valve -- is reachable inside
+        // a test run. These values put every one of those paths within a few blocks.
+        consensus.nSyzgyRandomXEpochLength = 50;
+        consensus.nSyzgyRandomXPrepBlocks  = 5;
+        consensus.nSyzgySyncWindow = 10;
+        consensus.nSyzgySyncTargetBlockSeconds = 60;
+        consensus.nSyzgySyncMinRatio = 30;
+        consensus.nSyzgySyncMaxRetargetPercent = 60;
+        consensus.nSyzgyPairingStallBlocks = 2;
+        consensus.nMaxFutureBlockTime = 15 * 60;
         consensus.nPowTargetTimespan = 2016 * 60; // 1.4 days
         consensus.nPowTargetSpacing = 1 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true;

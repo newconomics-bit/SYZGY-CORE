@@ -8,6 +8,7 @@
 #define RAVEN_CONSENSUS_PARAMS_H
 
 #include "uint256.h"
+#include <cstdint>
 #include <map>
 #include <string>
 
@@ -69,6 +70,44 @@ struct Params {
     /** Proof of work parameters */
     uint256 powLimit;
     uint256 kawpowLimit;
+
+    // ---------------------------------------------------------------------------------------
+    // SYZGY dual-PoW consensus parameters (FR-01..FR-04).
+    //
+    // FR-01: every block carries BOTH a KawPoW (GPU) proof and a RandomX (CPU) proof. Neither
+    // algorithm has a single shared target: the CPU target is retargeted by Monero-style LWMA
+    // (src/syzgy/syzgy_lwma.cpp) and the GPU target by Dark Gravity Wave. randomxLimit is the
+    // per-algorithm ceiling for the CPU/RandomX side, exactly as kawpowLimit is for the
+    // GPU/KawPoW side. No target may ever be easier than its own algorithm's limit.
+    // ---------------------------------------------------------------------------------------
+
+    /** Per-algorithm RandomX/CPU target limit. A target strictly above this is invalid. */
+    uint256 randomxLimit;
+
+    /** Block reward split between the two miner classes, in percent of the miner total. */
+    int nSyzgyGpuRewardPercent;
+    int nSyzgyCpuRewardPercent;
+
+    /** Fixed tail emission, paid once the computed base subsidy drops below the threshold. */
+    int64_t nSyzgyTailEmission;
+    int64_t nSyzgyTailEmissionThreshold;
+
+    /** RandomX dataset epoch length, and the pre-switch preparation window before each change. */
+    int nSyzgyRandomXEpochLength;
+    int nSyzgyRandomXPrepBlocks;
+
+    /** Sync Controller: LWMA window (blocks), target block time, and balance/retarget bounds. */
+    int nSyzgySyncWindow;
+    int nSyzgySyncTargetBlockSeconds;
+    int nSyzgySyncMinRatio;
+    int nSyzgySyncMaxRetargetPercent;
+
+    /** Consecutive slots a miner class may be absent before emergency (single-algo) mode. */
+    int nSyzgyPairingStallBlocks;
+
+    /** FR-04: how far into the future a block timestamp may be, relative to adjusted network time. */
+    int64_t nMaxFutureBlockTime;
+
     bool fPowAllowMinDifficultyBlocks;
     bool fPowNoRetargeting;
     int64_t nPowTargetSpacing;
