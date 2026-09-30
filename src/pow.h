@@ -146,19 +146,41 @@ bool GetRandomXSeedForHeight(const CBlockIndex* pindexPrev, const Consensus::Par
  * FR-04. A block may not be timestamped more than params.nMaxFutureBlockTime (15 minutes)
  * AHEAD OF ITS PARENT.
  *
- * Deliberately parent-relative and NOT wall-clock relative: this is a bound on how fast the
- * CHAIN may advance, which is what stops a miner from printing blocks with fabricated future
- * timestamps to inflate the difficulty window. It is an ADDITIONAL rule and never widens the
- * existing wall-clock bound in ContextualCheckBlockHeader.
+ * Deliberately parent-relative and NOT purely wall-clock-relative: a wall-clock bound alone
+ * does not stop a miner from printing a run of blocks whose timestamps are all allowed to sit
+ * slightly in the future, compressing the retarget window's timespan and driving the network's
+ * difficulty up for everyone else. What FR-04 bounds is how fast the CHAIN may advance.
  *
- * Guarded: both times are widened to signed 64-bit before subtracting, so a header whose nTime
+ * Guarded: the times are widened to signed 64-bit before subtracting, so a header whose nTime
  * is below its parent's (legal, and caught separately by the median-time-past rule) cannot wrap
  * the unsigned subtraction into a pass. A null parent is the genesis case -- the rule is defined
  * relative to a parent, and the genesis timestamp is a consensus constant fixed in chainparams
  * that no miner can choose -- so it returns true, and the caller comments the exemption.
+ *
+ * The pure parent-relative form. This is the FR-04 primitive the specification describes.
  */
 bool CheckBlockTimestampNotTooFarInFuture(const CBlockHeader* block,
                                           const CBlockIndex* pindexPrev,
+                                          const Consensus::Params& params);
+
+/**
+ * FR-04 AS WIRED. Identical, except the reference time is max(parent nTime, nNowTime) rather
+ * than the parent alone.
+ *
+ * The parent alone is unusable as a wiring reference: a genesis timestamp is a constant fixed
+ * at chain launch and on a real chain it is years old, so a 15-minute parent-relative bound
+ * would mean "no block may ever be dated more than 15 minutes after the chain was created" --
+ * which rejects EVERY block on regtest, on testnet, and on any fresh chain resumed from an old
+ * genesis. That is not a liveness escape hatch, it is a permanent halt, and it was observed
+ * before this overload was written. max(parent, now) keeps the parent-relative property exactly
+ * where it is meaningful (blocks running ahead of their parents) and degrades to the wall clock
+ * where the parent is stale.
+ *
+ * @param nNowTime the node's adjusted time; pass 0 for the pure parent-relative form.
+ */
+bool CheckBlockTimestampNotTooFarInFuture(const CBlockHeader* block,
+                                          const CBlockIndex* pindexPrev,
+                                          int64_t nNowTime,
                                           const Consensus::Params& params);
 
 #endif // RAVEN_POW_H

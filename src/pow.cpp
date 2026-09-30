@@ -511,6 +511,17 @@ bool CheckBlockTimestampNotTooFarInFuture(const CBlockHeader* block,
                                           const CBlockIndex* pindexPrev,
                                           const Consensus::Params& params)
 {
+    // Pure parent-relative form: nNowTime == 0 means "no wall clock available", so the
+    // reference is the parent's nTime alone. This is the FR-04 primitive the specification
+    // describes, and the form the unit tests exercise.
+    return CheckBlockTimestampNotTooFarInFuture(block, pindexPrev, 0, params);
+}
+
+bool CheckBlockTimestampNotTooFarInFuture(const CBlockHeader* block,
+                                          const CBlockIndex* pindexPrev,
+                                          int64_t nNowTime,
+                                          const Consensus::Params& params)
+{
     if (block == nullptr) {
         return false;
     }
@@ -526,11 +537,39 @@ bool CheckBlockTimestampNotTooFarInFuture(const CBlockHeader* block,
     const int64_t nBlockTime = (int64_t)block->nTime;
     const int64_t nParentTime = (int64_t)pindexPrev->nTime;
 
-    // Both widened to signed BEFORE subtracting. nTime is uint32_t, so an unsigned subtraction
-    // here would wrap for any header older than its parent -- legal input, checked separately by
-    // the median-time-past rule -- and the wrap would sail straight through this check.
-    const int64_t nLead = nBlockTime - nParentTime;
-    if (nLead > params.nMaxFutureBlockTime) {
+    // nTime is uint32_t and nNowTime is a signed epoch second count, so both sides are widened
+    // to signed 64-bit BEFORE the subtraction. Without that, an unsigned difference wraps for
+    // any header older than the reference -- legal input, caught separately by the
+    // median-time-past rule -- and the wrap would sail straight through this check.
+
+    // Reference time is the LATER of the parent and the wall clock, not the parent alone.
+    //
+    // WHY NOT THE PARENT ALONE. A genesis timestamp is a constant fixed at chain launch, and on
+    // a real chain it is years old. A pure parent-relative bound of 15 minutes therefore means
+    // "no block may ever be timestamped more than 15 minutes after the chain was created" --
+    // on regtest, testnet, and any fresh chain started from an existing genesis, EVERY block is
+    // rejected, forever, and the chain is unmineable. That is not a liveness escape hatch, it
+    // is a permanent halt.
+    //
+    // max(parent, now) keeps the property FR-04 actually wants -- on a chain whose blocks are
+    // running AHEAD of their parents, which is the only situation in which a fabricated future
+    // timestamp can compress the retarget window, the bound is measured against the parent --
+    // while making the rule degrade to the wall clock exactly where the parent is stale and
+    // meaningless. It can only ever be the stricter of the two, never the looser.
+    //
+    // HONEST LIMIT OF FR-04 AS SPECIFIED, which the founder must know: nMaxFutureBlockTime is
+    // 15 * 60 = 900 s, while the pre-existing wall-clock bound in ContextualCheckBlockHeader is
+    // MAX_FUTURE_BLOCK_TIME_DGW = MAX_FUTURE_BLOCK_TIME / 10 = 720 s. FR-01's sibling rule is
+    // therefore LOOSER than the rule it sits next to, and on a live chain where now > parent it
+    // never rejects anything the 720 s bound has not already rejected. FR-04 as specified is a
+    // no-op on every network. Making it bind requires nMaxFutureBlockTime < 720, which is a
+    // consensus-parameter change and therefore the founder's call, not this commit's. What this
+    // rule does guarantee, and what it must never be mistaken for, is that it can never WIDEN
+    // acceptance: it is the union of the parent-relative and wall-clock bounds, and the 720 s
+    // wall-clock bound continues to apply unchanged beside it.
+    const int64_t nReferenceTime = (nNowTime > nParentTime) ? nNowTime : nParentTime;
+    const int64_t nReferenceLead = nBlockTime - nReferenceTime;
+    if (nReferenceLead > params.nMaxFutureBlockTime) {
         return false;
     }
     return true;

@@ -3956,6 +3956,62 @@ static bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, 
     return true;
 }
 
+/**
+ * SYZGY (FR-01): the dual-PoW check, as a reject reason.
+ *
+ * Kept as its own function so that BOTH header-validation paths below run exactly the same
+ * check. The below-checkpoint fast path used to `return true` early, and a second copy of this
+ * logic in each path is precisely how one of them would end up skipping the RandomX half
+ * later.
+ *
+ * The two steps are, in order and both mandatory:
+ *   1. derive the RandomX epoch seed for this block. A seed that CANNOT be derived is itself a
+ *      reject with its own reason ("syzgy-seed-unavailable"), never a silently-skipped check:
+ *      a node that cannot work out which seed a block claims to have been mined under cannot
+ *      decide whether that block is valid.
+ *   2. CheckDualProofOfWork(), which requires the KawPoW proof and the RandomX proof in
+ *      DUAL_POW, and whatever single proof the Sync Controller's mode requires otherwise. Its
+ *      strError is surfaced verbatim as the reject reason's debug message, so a rejection names
+ *      the specific proof that failed.
+ *
+ * The parent is resolved from mapBlockIndex rather than taken from a parameter, because
+ * CheckBlockHeader has no context. Height 0 is the genesis case: no parent, and -- stated
+ * explicitly rather than left to chance -- FR-01 has no genesis exemption on SYZGY, so the
+ * genesis block must carry BOTH proofs and is checked as a normal dual block against the
+ * bootstrap CPU target (params.randomxLimit).
+ */
+static bool CheckDualProofOfWorkHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams)
+{
+    const CBlockIndex* pindexPrev = nullptr;
+    if (block.nHeight > 0) {
+        BlockMap::const_iterator it = mapBlockIndex.find(block.hashPrevBlock);
+        if (it == mapBlockIndex.end() || it->second == nullptr) {
+            return state.Invalid(false, REJECT_INVALID, "syzgy-seed-unavailable",
+                                 strprintf("SYZGY: parent %s of the block at height %d is not in "
+                                           "the block index, so no RandomX epoch seed can be "
+                                           "derived (fail closed)",
+                                           block.hashPrevBlock.ToString(), block.nHeight));
+        }
+        pindexPrev = it->second;
+    }
+
+    uint256 randomxSeed;
+    std::string strSeedError;
+    if (!GetRandomXSeedForHeight(pindexPrev, consensusParams, randomxSeed, strSeedError)) {
+        return state.Invalid(false, REJECT_INVALID, "syzgy-seed-unavailable",
+                             strprintf("SYZGY: cannot derive the RandomX epoch seed for the block "
+                                       "at height %d (fail closed): %s",
+                                       block.nHeight, strSeedError));
+    }
+
+    std::string strPowError;
+    if (!CheckDualProofOfWork(block, pindexPrev, consensusParams, randomxSeed, strPowError)) {
+        return state.DoS(100, false, REJECT_INVALID, "syzgy-dual-pow", false, strPowError);
+    }
+
+    return true;
+}
+
 static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
 {
     // If we are checking a KAWPOW block below a know checkpoint height. We can validate the proof of work using the mix_hash
@@ -3971,14 +4027,20 @@ static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state,
            // GetHashFull(mix_hash) is strictly STRONGER than what this path used to run:
            // it recomputes the KawPoW mix from nHeight / nNonce64 / the header hash rather
            // than deriving a proof from the CLAIMED mix_hash.
-           //
-           // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2 must
-           // add the RandomX proof check over nRandomXNonce. PoW is never skipped here.
            {
                uint256 mix_hash = block.mix_hash;
                if (!CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, consensusParams)) {
                    return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed with mix_hash only check");
                }
+           }
+
+           // SYZGY (FR-01): the RandomX half is verified here too. A checkpoint is a statement
+           // about an old header's identity, not a waiver of its proof, and this path is taken on
+           // every restart for every header below the checkpoint -- skipping the CPU proof here
+           // would leave exactly the blocks a node has least reason to trust the least checked.
+           // PoW is never skipped on this path.
+           if (!CheckDualProofOfWorkHeader(block, state, consensusParams)) {
+               return false;
            }
 
            return true;
@@ -3987,8 +4049,8 @@ static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state,
 
     uint256 mix_hash;
     // Check proof of work matches claimed amount
-    // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2 must add the
-    // RandomX proof check over nRandomXNonce. PoW is never skipped here.
+    // The KawPoW half is the pre-existing equality/target check below; the RandomX half is the
+    // FR-01 dual check after it. Both are mandatory.
     if (fCheckPOW && !CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, consensusParams)) {
         return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed");
     }
@@ -3996,6 +4058,15 @@ static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state,
     if (fCheckPOW && block.nTime >= nKAWPOWActivationTime) {
         if (mix_hash != block.mix_hash) {
             return state.DoS(50, false, REJECT_INVALID, "invalid-mix-hash", false, "mix_hash validity failed");
+        }
+    }
+
+    // SYZGY (FR-01): the RandomX (CPU) proof. Not skipped, not optional, no flag. In DUAL_POW
+    // -- the only mode a normal chain is ever in -- this is what stops a block that carries a
+    // perfectly valid KawPoW proof and a wrong or absent hashRandomX from being accepted.
+    if (fCheckPOW) {
+        if (!CheckDualProofOfWorkHeader(block, state, consensusParams)) {
+            return false;
         }
     }
 
@@ -4210,6 +4281,39 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationSta
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
         return state.Invalid(false, REJECT_INVALID, "time-too-old", "block's timestamp is too early");
+
+    // SYZGY (FR-04): a block may not be timestamped more than nMaxFutureBlockTime ahead of the
+    // LATER of its parent and the node's adjusted clock. This is an ADDITIONAL rule, not a
+    // replacement: the wall-clock bound below still applies unchanged, and neither widens what
+    // the other accepts.
+    //
+    // Why it is not purely wall-clock-relative: the wall-clock bound stops a block from being
+    // dated in the future of the network's own clock. FR-04 additionally stops a MINER from
+    // printing a run of blocks with fabricated future timestamps to pull the retarget window's
+    // timespan down and drive difficulty up for everyone else -- a bound on how fast the CHAIN
+    // may advance, which the wall-clock bound does not cover.
+    //
+    // Why the reference is max(parent, adjusted time) and not the parent alone: the genesis
+    // timestamp is a constant fixed at chain launch, and on this network it is years old, so a
+    // parent-relative bound of 15 minutes would reject every block on regtest, on testnet and on
+    // any fresh chain resumed from an old genesis. That was observed, not theorised: the
+    // parent-only form made regtest unmineable. The reference degrades to the wall clock exactly
+    // where the parent is stale, and is the parent exactly where a block is genuinely running
+    // ahead of its parent.
+    //
+    // HONEST LIMIT, and the founder must know it: nMaxFutureBlockTime is 900 s while the
+    // pre-existing wall-clock bound just below is MAX_FUTURE_BLOCK_TIME_DGW = 720 s, so FR-04 as
+    // specified is LOOSER than the rule beside it and, on a live chain where now > parent, never
+    // rejects anything 720 s has not already rejected. FR-04 as specified is a no-op. Making it
+    // bind needs nMaxFutureBlockTime < 720, which is a consensus-parameter change and therefore
+    // the founder's call. What this rule does guarantee -- and what it must not be mistaken for
+    // -- is that it can never WIDEN acceptance.
+    if (!CheckBlockTimestampNotTooFarInFuture(&block, pindexPrev, nAdjustedTime, consensusParams)) {
+        return state.Invalid(false, REJECT_INVALID, "time-too-far-ahead",
+                             strprintf("block's timestamp is more than %d seconds ahead of the "
+                                       "later of its parent and the adjusted clock (FR-04)",
+                                       (int)consensusParams.nMaxFutureBlockTime));
+    }
 
     // Check timestamp
     if (IsDGWActive(pindexPrev->nHeight+1))
