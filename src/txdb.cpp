@@ -490,8 +490,25 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->hashRandomX    = diskindex.hashRandomX;
                 pindexNew->nHeight        = diskindex.nHeight;
 
-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams))
-                    return error("%s: CheckProofOfWork failed: %s", __func__, pindexNew->ToString());
+                // SYZGY: the PoW check must target the PROOF hash recomputed from the
+                // disk record's own fields, never the identity hash and never a hash read
+                // back from the database. pindexNew->GetBlockHash() is *phashBlock, i.e.
+                // the value that was just stored as the mapBlockIndex key -- comparing
+                // that against nBits checks nothing. CBlockIndex::GetBlockHeader() is
+                // also unusable here because it dereferences pprev, which need not be
+                // loaded yet during index load (and is legitimately null for genesis), so
+                // CDiskBlockIndex::GetProofHeader() is used: it reads hashPrev out of
+                // this record.
+                //
+                // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2
+                // must add the RandomX proof check over nRandomXNonce. PoW is never
+                // skipped here, on any branch.
+                {
+                    const CBlockHeader diskHeader = diskindex.GetProofHeader();
+                    uint256 mix_hash = diskHeader.mix_hash;
+                    if (!CheckProofOfWork(diskHeader.GetHashFull(mix_hash), diskHeader.nBits, consensusParams))
+                        return error("%s: CheckProofOfWork failed: %s", __func__, diskHeader.ToString().c_str());
+                }
 
                 pcursor->Next();
             } else {

@@ -1302,9 +1302,22 @@ bool ReadBlockFromDisk(CBlock& block, const CDiskBlockPos& pos, const Consensus:
         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
     }
 
-    // Check the header
-    if (!CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
-        return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
+    // Check the header.
+    //
+    // SYZGY: the PoW comparison must target the PROOF hash, not the block identity.
+    // block.GetHash() is SerializeHash(*this), i.e. an unrelated random quantity that
+    // commits to mix_hash and hashRandomX; comparing it against nBits would reject
+    // valid blocks. GetHashFull(mix_hash) recomputes the proof from the header
+    // (nHeight / nNonce64 / header hash) instead.
+    //
+    // SYZGY/Wave-2 (partial check): only the KawPoW half is verified here. The RandomX
+    // proof over nRandomXNonce is NOT checked yet -- Wave 2 must add that check before
+    // dual-PoW is considered fully validated. PoW is never skipped, on any branch.
+    {
+        uint256 mix_hash = block.mix_hash;
+        if (!CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, consensusParams))
+            return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
+    }
 
     return true;
 }
@@ -3949,8 +3962,23 @@ static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state,
     if (fCheckPOW && block.nTime >= nKAWPOWActivationTime) {
         CBlockIndex* pcheckpoint = Checkpoints::GetLastCheckpoint(GetParams().Checkpoints());
         if (fCheckPOW && pcheckpoint && block.nHeight <= (uint32_t)pcheckpoint->nHeight) {
-           if (!CheckProofOfWork(block.GetHash(), block.nBits, consensusParams)) {
-               return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed with mix_hash only check");
+           // SYZGY: this is the below-checkpoint fast path and it was still comparing the
+           // block IDENTITY against nBits. block.GetHash() is now SerializeHash(*this),
+           // which commits to mix_hash and hashRandomX and is an unrelated random value,
+           // so this rejected valid blocks -- most visibly on restart, when every header
+           // below the last checkpoint is re-validated through this path.
+           //
+           // GetHashFull(mix_hash) is strictly STRONGER than what this path used to run:
+           // it recomputes the KawPoW mix from nHeight / nNonce64 / the header hash rather
+           // than deriving a proof from the CLAIMED mix_hash.
+           //
+           // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2 must
+           // add the RandomX proof check over nRandomXNonce. PoW is never skipped here.
+           {
+               uint256 mix_hash = block.mix_hash;
+               if (!CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, consensusParams)) {
+                   return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed with mix_hash only check");
+               }
            }
 
            return true;
@@ -3959,6 +3987,8 @@ static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state,
 
     uint256 mix_hash;
     // Check proof of work matches claimed amount
+    // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2 must add the
+    // RandomX proof check over nRandomXNonce. PoW is never skipped here.
     if (fCheckPOW && !CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, consensusParams)) {
         return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed");
     }

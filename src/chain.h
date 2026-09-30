@@ -485,6 +485,34 @@ public:
         return block.GetHash();
     }
 
+    // SYZGY: build the header from the disk record's OWN fields.
+    //
+    // CBlockIndex::GetBlockHeader() cannot be used while the index is being loaded
+    // (LoadBlockIndexGuts): it dereferences pprev, and pprev is only assigned via
+    // insertBlockIndex(diskindex.hashPrev) in the same loop, so it may be an
+    // unpopulated stub -- and for the genesis entry it is legitimately null. hashPrev
+    // is stored in this very record, so it is the correct and always-available source.
+    //
+    // Callers use this to RECOMPUTE the proof over the record as persisted, rather than
+    // trusting a hash that was read back from the database.
+    CBlockHeader GetProofHeader() const
+    {
+        CBlockHeader block;
+        block.nVersion        = nVersion;
+        block.hashPrevBlock   = hashPrev;
+        block.hashMerkleRoot  = hashMerkleRoot;
+        block.nTime           = nTime;
+        block.nBits           = nBits;
+        block.nNonce          = nNonce;
+
+        block.nHeight         = nHeight;
+        block.nNonce64        = nNonce64;
+        block.mix_hash        = mix_hash;
+        block.nRandomXNonce   = nRandomXNonce;
+        block.hashRandomX     = hashRandomX;
+        return block;
+    }
+
 
     std::string ToString() const
     {
