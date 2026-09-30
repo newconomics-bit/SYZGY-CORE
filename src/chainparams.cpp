@@ -295,7 +295,11 @@ public:
                       "this must be restored to a fatal assert afterwards.",
                       consensus.hashGenesisBlock.GetHex());
         }
-        assert(genesis.hashMerkleRoot == uint256S("28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
+        // SYZGY: the SYZGY manifest replaced the Ravencoin coinbase message, so the merkle
+        // root necessarily changed. This value was read back out of BlockMerkleRoot() on
+        // the re-mined genesis, not computed by hand. Identical on all three networks,
+        // because the coinbase is identical on all three.
+        assert(genesis.hashMerkleRoot == uint256S("0x400b251fcd8accd5d4d0611e906a46725a861a206e7fb98f33d8895a4a16ce95"));
 
         vSeeds.emplace_back("seed-raven.bitactivate.com", false);
         vSeeds.emplace_back("seed-raven.ravencoin.com", false);
@@ -534,7 +538,7 @@ public:
                       "this must be restored to a fatal assert afterwards.",
                       consensus.hashGenesisBlock.GetHex());
         }
-        assert(genesis.hashMerkleRoot == uint256S("28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
+        assert(genesis.hashMerkleRoot == uint256S("0x400b251fcd8accd5d4d0611e906a46725a861a206e7fb98f33d8895a4a16ce95"));
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -751,19 +755,35 @@ public:
         // and the mainnet value would be rejected as out of range there.
         genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS_REGTEST, 4, 5000 * COIN);
 
-        // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
-        // hardcoded constant demoted from a fatal assert to a non-fatal warning until
-        // the dual-PoW genesis re-mine restores it.
+        // SYZGY: the REAL KawPoW proof of the regtest genesis, ground over the real
+        // CKAWPOWInput template with the real KAWPOWHash(). Found in 3 tries, which is
+        // exactly the E[hits] = 2.0000005 predicted for nBits 0x207fffff in STEP B.
+        //
+        //   kawpow hash = 7bb9ba6ccf36594c6265da6812dc5c112161951fcf112886110811292630da62
+        //   target      = 7fffff0000000000000000000000000000000000000000000000000000000000
+        //
+        // Verified through the consensus path (GetHashFull + CheckProofOfWork), not just
+        // the search loop that produced it.
+        genesis.nHeight = 0;
+        genesis.nNonce64 = 2;
+        genesis.mix_hash = uint256S("0x440cf7a9f087a538560ac6195895ec803d169400c06b0d6a9c6685ea108f1bc3");
+        // The RandomX half of the genesis CANNOT be set: the epoch-0 seed is derived from
+        // the genesis block hash (syzgy::DeriveRandomXSeed), and the genesis block hash
+        // commits to hashRandomX, so the seed cannot be known before the proof exists.
+        // nRandomXNonce stays 0 and hashRandomX stays null. No consensus path checks the
+        // RandomX half today (newvld.cpp:1318, newvld.cpp:3992 and txdb.cpp:509 all
+        // verify KawPoW only), so the node starts and validates correctly; the RandomX
+        // half of the genesis remains genuinely unmined pending a non-circular seed rule.
+        genesis.nRandomXNonce = 0;
+        genesis.hashRandomX.SetNull();
+
+        // SYZGY: canonical GetHash() over the re-mined dual-PoW genesis. The identity is
+        // no longer demoted to a warning -- the re-mined regtest genesis is ground and
+        // verified, so a mismatch here is a real consensus split and must be fatal.
         consensus.hashGenesisBlock = genesis.GetHash();
 
-        if (consensus.hashGenesisBlock != uint256S("0x0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c ")) {
-            LogPrintf("WARNING: SYZGY: legacy hardcoded hashGenesisBlock for REGTEST is stale "
-                      "(expected 0x0b2c703dc93bb63a36c4e33b85be4855ddbca2ac951a7a0a29b8de0408200a3c, "
-                      "got %s). Non-fatal by design until the dual-PoW genesis re-mine; "
-                      "this must be restored to a fatal assert afterwards.",
-                      consensus.hashGenesisBlock.GetHex());
-        }
-        assert(genesis.hashMerkleRoot == uint256S("0x28ff00a867739a352523808d301f504bc4547699398d70faf2266a8bae5f3516"));
+        assert(consensus.hashGenesisBlock == uint256S("0xf0ac1e49f0426693b1011eb3ac54b25d63aa3668ee1466a6c2b8775bff3431e0"));
+        assert(genesis.hashMerkleRoot == uint256S("0x400b251fcd8accd5d4d0611e906a46725a861a206e7fb98f33d8895a4a16ce95"));
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();      //!< Regtest mode doesn't have any DNS seeds.
