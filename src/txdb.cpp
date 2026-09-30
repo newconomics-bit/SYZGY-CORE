@@ -461,6 +461,23 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
 {
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
 
+    // SYZGY (FR-01): the dual-PoW re-check is a SECOND PASS, not inline in the scan below.
+    //
+    // WHY IT CANNOT BE INLINE. The leveldb scan visits DB_BLOCK_INDEX in BLOCK-HASH order, so
+    // when a record is read its parent may be a stub: insertBlockIndex(diskindex.hashPrev) has
+    // created the entry but not populated it, and it may not have been visited at all. The CPU
+    // target is derived from the parent through LWMA over a trailing window, and the epoch seed
+    // for epoch N > 0 is anchored on a block up to nSyzgyRandomXEpochLength - 1 further back.
+    // Both need a POPULATED ancestor chain. Checking inline would make a node's acceptance of
+    // its own index depend on the hash order its database happens to iterate in -- the same
+    // class of order-dependent bug as the identity-vs-nBits bugs already fixed in this file.
+    //
+    // The second pass walks the loaded indices in ASCENDING HEIGHT, so every ancestor of a block
+    // is fully populated by the time that block is checked, deterministically and regardless of
+    // storage order. CBlockIndex::GetBlockHeader() is usable there precisely because pprev is no
+    // longer a stub (and is still legitimately null for genesis, which the check handles).
+    std::vector<CBlockIndex*> vLoadedIndices;
+
     pcursor->Seek(std::make_pair(DB_BLOCK_INDEX, uint256()));
 
     // Load mapBlockIndex
@@ -500,15 +517,13 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 // CDiskBlockIndex::GetProofHeader() is used: it reads hashPrev out of
                 // this record.
                 //
-                // SYZGY/Wave-2 (partial check): only the KawPoW half is verified. Wave 2
-                // must add the RandomX proof check over nRandomXNonce. PoW is never
-                // skipped here, on any branch.
-                {
-                    const CBlockHeader diskHeader = diskindex.GetProofHeader();
-                    uint256 mix_hash = diskHeader.mix_hash;
-                    if (!CheckProofOfWork(diskHeader.GetHashFull(mix_hash), diskHeader.nBits, consensusParams))
-                        return error("%s: CheckProofOfWork failed: %s", __func__, diskHeader.ToString().c_str());
-                }
+                // SYZGY (FR-01): the full dual check -- KawPoW AND RandomX -- is NOT done
+                // here but in the ascending-height second pass at the end of this function.
+                // The reason is the parent's state, not the check itself: at this point in a
+                // hash-ordered scan the parent may be an unpopulated stub, and the CPU target
+                // and the epoch seed both need a populated ancestor chain. The record is
+                // queued for that pass below. PoW is never skipped, on any branch.
+                vLoadedIndices.push_back(pindexNew);
 
                 pcursor->Next();
             } else {
@@ -516,6 +531,48 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
             }
         } else {
             break;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // SYZGY (FR-01) second pass: verify the DUAL proof of every index entry just loaded.
+    //
+    // Ascending height, so every ancestor of the block under test is already fully populated.
+    // CheckDualProofOfWork() is the SAME function ContextualCheckBlockHeader() runs on a live
+    // header, with the same fail-closed seed derivation -- there is no weaker index-load variant
+    // to drift from the live one.
+    //
+    // Genesis is included and is NOT exempt: FR-01 has no genesis exemption on SYZGY, so a
+    // genesis whose hashRandomX is absent or wrong makes the index unloadable. That is intended.
+    // ---------------------------------------------------------------------------------------
+    if (!vLoadedIndices.empty()) {
+        std::sort(vLoadedIndices.begin(), vLoadedIndices.end(),
+                  [](const CBlockIndex* a, const CBlockIndex* b) {
+                      if (a->nHeight != b->nHeight) return a->nHeight < b->nHeight;
+                      // Two entries at the same height can only be distinct blocks on a fork;
+                      // order them by hash so the pass is deterministic rather than dependent on
+                      // the order the sort happened to receive them in.
+                      return a->GetBlockHash() < b->GetBlockHash();
+                  });
+
+        for (size_t i = 0; i < vLoadedIndices.size(); ++i) {
+            CBlockIndex* pindex = vLoadedIndices[i];
+            const CBlockHeader header = pindex->GetBlockHeader();
+
+            uint256 randomxSeed;
+            std::string strSeedError;
+            if (!GetRandomXSeedForHeight(pindex->pprev, consensusParams, randomxSeed, strSeedError)) {
+                return error("%s: cannot derive the RandomX epoch seed for the block at height %d "
+                             "(%s) -- refusing to load this block index (fail closed)",
+                             __func__, pindex->nHeight, strSeedError);
+            }
+
+            std::string strPowError;
+            if (!CheckDualProofOfWork(header, pindex->pprev, consensusParams, randomxSeed, strPowError)) {
+                return error("%s: dual proof of work failed for the block at height %d (%s) -- "
+                             "refusing to load this block index",
+                             __func__, pindex->nHeight, strPowError);
+            }
         }
     }
 
