@@ -654,6 +654,13 @@ void static RavenMiner(const CChainParams& chainparams)
                 LogPrintf("RavenMiner: WARNING: RandomX unavailable, CPU half of the dual proof "
                           "cannot be computed; the RandomX half will be treated as unsatisfied "
                           "until initialisation succeeds\n");
+            // Outer loop: search for a solution, then re-check the tip / nTime and go
+            // round again. This is the pre-SYZGY structure and is kept.
+            while (true)
+            {
+            // Inner loop: the proof search itself. Leaving it (rather than the outer loop)
+            // on a solution is deliberate -- the outer loop then re-checks the tip and
+            // updates nTime, which invalidates the header and starts a fresh search.
             while (true)
             {
 
@@ -727,7 +734,7 @@ void static RavenMiner(const CChainParams& chainparams)
                     if ((pblock->nNonce & 0xFF) == 0)
                         break;
                 }
-            }
+            }   // end of the proof-search inner loop
 
             // Check for stop or if block needs to be rebuilt
             boost::this_thread::interruption_point();
