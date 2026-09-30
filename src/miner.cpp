@@ -648,7 +648,9 @@ void static RavenMiner(const CChainParams& chainparams)
             // can be starved or can unilaterally dominate the chain's real hash rate.
             const bool fDualProof = (pblock->nTime >= nKAWPOWActivationTime);
             // RandomX seed for the CPU half of the proof. Derived deterministically from
-            // the chain; see syzgy::DeriveRandomXSeed().
+            // the chain; see syzgy::RandomXSeedForEpoch() / syzgy::RandomXEpoch0Seed()
+            // (epoch 0 anchors on the genesis merkle root, NOT the genesis block hash --
+            // the latter would be a fixed point, since the header commits to hashRandomX).
             const uint256 randomXSeed = syzgy::RandomXActiveSeed();
             if (fDualProof && !syzgy::RandomXIsAvailable())
                 LogPrintf("RavenMiner: WARNING: RandomX unavailable, CPU half of the dual proof "

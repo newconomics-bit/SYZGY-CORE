@@ -389,15 +389,84 @@ bool RandomXCheckProof(const CBlockHeader& header, const uint256& seed, const ui
     return true;
 }
 
-uint256 DeriveRandomXSeed(const uint8_t* anchorHash32, const std::string& tag)
+uint256 DeriveRandomXSeed(const uint8_t* anchor32, const std::string& tag)
 {
     // CONSENSUS CRITICAL -- see the header comment. Do not change.
     CHash256 hasher;
     hasher.Write(reinterpret_cast<const unsigned char*>(tag.data()), tag.size());
-    hasher.Write(anchorHash32, 32);
+    hasher.Write(anchor32, 32);
     uint256 out;
     hasher.Finalize(out.begin());
     return out;
+}
+
+uint256 RandomXEpoch0Seed(const uint256& genesisMerkleRoot, const std::string& tag)
+{
+    // Fail closed on a null merkle root rather than hashing a known pre-image.
+    if (genesisMerkleRoot.IsNull()) {
+        return uint256();
+    }
+    return DeriveRandomXSeed(genesisMerkleRoot.begin(), tag);
+}
+
+bool RandomXAnchorForEpoch(int64_t nEpoch, int64_t nEpochLength,
+                           const uint256& genesisMerkleRoot,
+                           const RandomXBlockHashLookup& blockHashAtHeight,
+                           uint256& anchorOut,
+                           std::string& strError)
+{
+    anchorOut.SetNull();
+
+    if (nEpoch <= 0) {
+        // Epoch 0: the GENESIS MERKLE ROOT, never the genesis block hash. The merkle root
+        // commits to the coinbase only, so it is known before hashRandomX exists; the genesis
+        // block hash commits to hashRandomX itself and would make the derivation a fixed
+        // point. See the long form in randomx_glue.h.
+        if (genesisMerkleRoot.IsNull()) {
+            strError = "SYZGY: null genesis merkle root -- cannot derive the epoch 0 RandomX seed";
+            return false;
+        }
+        anchorOut = genesisMerkleRoot;
+        strError.clear();
+        return true;
+    }
+
+    if (nEpochLength <= 0) {
+        strError = strprintf("SYZGY: invalid RandomX epoch length %d", (int)nEpochLength);
+        return false;
+    }
+    if (!blockHashAtHeight) {
+        strError = "SYZGY: no block hash lookup supplied for a non-zero RandomX epoch";
+        return false;
+    }
+
+    // Last block of the previous epoch. Unchanged rule.
+    const int64_t nAnchorHeight = nEpoch * nEpochLength - 1;
+    uint256 anchor;
+    if (!blockHashAtHeight(nAnchorHeight, anchor) || anchor.IsNull()) {
+        strError = strprintf("SYZGY: unknown RandomX epoch anchor block at height %d", (int)nAnchorHeight);
+        return false;
+    }
+
+    anchorOut = anchor;
+    strError.clear();
+    return true;
+}
+
+bool RandomXSeedForEpoch(int64_t nEpoch, int64_t nEpochLength,
+                         const uint256& genesisMerkleRoot,
+                         const RandomXBlockHashLookup& blockHashAtHeight,
+                         uint256& seedOut,
+                         std::string& strError)
+{
+    uint256 anchor;
+    if (!RandomXAnchorForEpoch(nEpoch, nEpochLength, genesisMerkleRoot, blockHashAtHeight, anchor, strError)) {
+        seedOut.SetNull();
+        return false;
+    }
+    seedOut = DeriveRandomXSeed(anchor.begin(), SYZGY_RANDOMX_SEED_TAG);
+    strError.clear();
+    return true;
 }
 
 int64_t RandomXEpochForHeight(int64_t nHeight, int64_t nEpochLength)
@@ -409,7 +478,7 @@ int64_t RandomXEpochForHeight(int64_t nHeight, int64_t nEpochLength)
 
 int64_t RandomXAnchorHeightForEpoch(int64_t nEpoch, int64_t nEpochLength)
 {
-    if (nEpoch <= 0) return 0;                       // epoch 0 anchors on the genesis block
+    if (nEpoch <= 0) return 0;                       // epoch 0 has no anchor BLOCK (merkle root)
     if (nEpochLength <= 0) return 0;
     return nEpoch * nEpochLength - 1;               // last block of the previous epoch
 }

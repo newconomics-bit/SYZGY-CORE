@@ -41,11 +41,22 @@ be satisfied for one header while a RandomX proof is satisfied for another.
 RandomX's dataset is expensive to build, so SYZGY re-derives it periodically from
 chain data. For epoch length `L` and epoch `N`:
 
-* `N == 0` → the anchor is the **genesis block hash**.
+* `N == 0` → the anchor is the **genesis merkle root** (`genesis.hashMerkleRoot`),
+  *not* the genesis block hash.
 * `N >  0` → the anchor is the hash of the block at height `N*L - 1`, i.e. the
   **last block of the previous epoch**.
 
-    seed = CHash256( "SYZGY/randomx/seed/v1" || anchor_hash_32bytes )
+    seed = CHash256( "SYZGY/randomx/seed/v1" || anchor_32bytes )
+
+**Why the merkle root for epoch 0.** Block identity is `SerializeHash(*this)` over the
+canonical dual-PoW header, and that header commits to `hashRandomX`. Deriving `seed0`
+from the genesis *block hash* is therefore a fixed point — grinding `hashRandomX`
+changes the genesis hash, which changes `seed0`, which changes every RandomX hash.
+The merkle root commits to the genesis coinbase only, so it is known before any proof
+exists. Without this rule FR-01 cannot be satisfied at height 0 at all: a null
+`hashRandomX` at genesis is an invalid genesis. Do not "fix" this by hashing a
+genesis hash computed with `hashRandomX` zeroed — that genesis-only special-case
+pre-image is the same bug class that has bitten this codebase before.
 
 Every node derives the same seed from the chain alone — no consensus chatter, no
 miner-selectable randomness, no off-chain coordination. Changing the tag, the
