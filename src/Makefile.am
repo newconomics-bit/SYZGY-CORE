@@ -215,6 +215,7 @@ RAVEN_CORE_H = \
   streams.h \
   support/allocators/secure.h \
   syzgy/randomx_glue.h \
+  syzgy/syzgy_sync.h \
   support/allocators/zeroafterfree.h \
   support/cleanse.h \
   support/events.h \
@@ -292,7 +293,8 @@ libraven_server_a_SOURCES = \
   policy/fees.cpp \
   policy/policy.cpp \
   policy/rbf.cpp \
-  pow.cpp \
+pow.cpp \
+  syzgy/syzgy_sync.cpp \
   rest.cpp \
   rpc/assets.cpp \
   rpc/blockchain.cpp \
@@ -462,6 +464,8 @@ libraven_consensus_a_SOURCES = \
   pubkey.cpp \
   pubkey.h \
   syzgy/randomx_glue.cpp \
+  syzgy/syzgy_lwma.cpp \
+  syzgy/syzgy_lwma.h \
   script/ravenconsensus.cpp \
   script/interpreter.cpp \
   script/interpreter.h \
