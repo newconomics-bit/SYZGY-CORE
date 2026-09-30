@@ -4120,6 +4120,30 @@ std::vector<unsigned char> GenerateCoinbaseCommitment(CBlock& block, const CBloc
  *  set; UTXO-related validity checks are done in ConnectBlock(). */
 static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& state, const CChainParams& params, const CBlockIndex* pindexPrev, int64_t nAdjustedTime)
 {
+    // SYZGY: the block identity (CBlockHeader::GetHash) commits to nHeight, because
+    // nHeight is part of the canonical dual-PoW serialisation. That makes the declared
+    // height part of the block's identity, so it MUST be validated against the chain
+    // BEFORE the block is keyed into mapBlockIndex under that identity.
+    //
+    // Without this check a peer could hand us a header whose nHeight disagrees with
+    // hashPrevBlock's height. mapBlockIndex would accept it at the height baked into the
+    // hash, the index would record a nonsensical height, and the later
+    // ReadBlockFromDisk() check `block.GetHash() != pindex->GetBlockHash()` /
+    // `block.nHeight != pindex->nHeight` would mismatch and reach AbortNode -- a
+    // remotely reachable node-kill / DoS.
+    //
+    // This runs ahead of the assert(pindexPrev != nullptr) below so the genesis branch is
+    // live: for the genesis block there is no parent, so the only accepted height is 0.
+    if (pindexPrev == nullptr) {
+        if (block.nHeight != 0)
+            return state.Invalid(false, REJECT_INVALID, "bad-block-height",
+                                 strprintf("genesis block declared height %d, expected 0", block.nHeight));
+    } else if (block.nHeight != static_cast<uint32_t>(pindexPrev->nHeight + 1)) {
+        return state.Invalid(false, REJECT_INVALID, "bad-block-height",
+                             strprintf("block declared height %d, expected %d",
+                                      block.nHeight, pindexPrev->nHeight + 1));
+    }
+
     assert(pindexPrev != nullptr);
     const int nHeight = pindexPrev->nHeight + 1;
 
