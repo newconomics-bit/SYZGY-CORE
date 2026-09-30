@@ -15,6 +15,48 @@
 #include <assert.h>
 #include "chainparamsseeds.h"
 
+/**
+ * SYZGY genesis constants.
+ *
+ * SYZGY_MANIFEST is written into the genesis coinbase scriptSig. It is consensus
+ * critical: it is part of the coinbase, hence of hashMerkleRoot, hence of the KawPoW
+ * and RandomX templates, hence of both proofs.
+ *
+ * SYZGY_GENESIS_BITS is deliberately the EASIEST possible mainnet-shaped target, so
+ * that the RandomX half of the genesis proof is findable on commodity hardware. See
+ * the retarget note on CRegTestParams / Step B for the arithmetic.
+ */
+static const char* const SYZGY_GENESIS_MANIFEST =
+    "attention is gold and time is money. - SYZGY Genesis";
+
+/** SYZGY launch time, shared by all three networks: 2026-09-27 13:00:00 UTC. */
+static const uint32_t SYZGY_GENESIS_TIME = 1790514000;
+
+/**
+ * SYZGY genesis difficulty: 0x200fff.
+ *
+ * 0x200fff is the EASIEST compact target that CheckProofOfWork() will still accept on
+ * mainnet, because it is the largest 0x20xxxx mantissa that stays at or below powLimit
+ * (consensus.powLimit == 0x00000fff...ff, whose compact form is 0x20000f). Any
+ * mantissa above 0x0fff is rejected by the range check in CheckProofOfWork():
+ *
+ *     target(0x200fff) = 0x000fff * 2^232
+ *
+ * Expected work to satisfy it:
+ *
+ *     E[hits] = 2^256 / target = 2^256 / (0x000fff * 2^232)
+ *             = 2^24 / 4095
+ *             = 4096.25...
+ *
+ * so ~4096 trials. KawPoW does millions of H/s, so that is sub-millisecond of GPU work.
+ * RandomX does order 100-1000 H/s per core, so ~4096 RandomX hashes is roughly 4-40
+ * seconds -- seconds, not days. A Bitcoin-style 0x1e00ffff would be 2^32 = 4.3e9 trials
+ * and is NOT feasible under RandomX. The genesis is therefore deliberately trivial;
+ * real difficulty begins at block 1, where normal retargeting takes over (see the
+ * retarget note below and STEP B in the history).
+ */
+static const uint32_t SYZGY_GENESIS_BITS = 0x200fff;
+
 //TODO: Take these out
 extern double algoHashTotal[16];
 extern int algoHashHits[16];
@@ -52,9 +94,14 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
  *     CTxOut(nValue=50.00000000, scriptPubKey=0x5F1DF16B2B704C8A578D0B)
  *   vMerkleTree: 4a5e1e
  */
-static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
+/**
+ * SYZGY: the coinbase scriptSig manifest is a parameter, not a constant, so that each
+ * network states the same SYZGY manifest while keeping its own nTime / nBits / version.
+ * The manifest is part of the coinbase, so it is consensus critical: it feeds
+ * hashMerkleRoot, which feeds the KawPoW and RandomX templates, which feed the proofs.
+ */
+static CBlock CreateGenesisBlock(const char* pszTimestamp, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
-    const char* pszTimestamp = "The Times 03/Jan/2018 Bitcoin is name of the game for new generation of firms";
     const CScript genesisOutputScript = CScript() << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f") << OP_CHECKSIG;
     return CreateGenesisBlock(pszTimestamp, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
 }
@@ -181,7 +228,9 @@ public:
         nDefaultPort = 8767;
         nPruneAfterHeight = 100000;
 
-        genesis = CreateGenesisBlock(1514999494, 25023712, 0x1e00ffff, 4, 5000 * COIN);
+        // SYZGY genesis: the coinbase carries the SYZGY manifest, and nTime is the SYZGY
+        // launch time. The nonce / proof fields are filled in by the dual-PoW re-mine.
+        genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
 
         // SYZGY: derive the genesis id from the canonical identity hash. GetX16RHash()
         // hashed the raw memory range BEGIN(nVersion)..END(nNonce), which no longer
@@ -278,7 +327,7 @@ public:
         strGlobalBurnAddress = "RXBurnXXXXXXXXXXXXXXXXXXXXXXWUo9FV";
 
         // DGW Activation
-        nDGWActivationBlock = 338778;
+        nDGWActivationBlock = 1;
 
         nMaxReorganizationDepth = 60; // 60 at 1 minute block timespan is +/- 60 minutes.
         nMinReorganizationPeers = 4;
@@ -288,8 +337,15 @@ public:
         nMessagingActivationBlock = 1092672; // Messaging activated block height
         nRestrictedActivationBlock = 1092672; // Restricted activated block height
 
-        nKAAAWWWPOWActivationTime = 1588788000; // UTC: Wed May 06 2020 18:00:00
-        nKAWPOWActivationTime = nKAAAWWWPOWActivationTime;
+        // SYZGY: dual-PoW is active FROM THE GENESIS BLOCK, on every network. The genesis
+        // header's nTime is therefore always >= this value, so GetHashFull() always takes
+        // the KawPoW branch and the legacy x16r / x16rv2 single-hash branch is dead code on
+        // a SYZGY chain. Keeping this at a 2020 wall-clock timestamp instead is what made
+        // the genesis take the x16rv2 branch over a header whose nNonce is 0 (it is not
+        // serialised any more), so its PoW could never verify and every node aborted in
+        // ReadBlockFromDisk. Do not move these off 0 without re-mining the genesis.
+        nKAAAWWWPOWActivationTime = 0;
+        nKAWPOWActivationTime = 0;
         /** RVN End **/
     }
 };
@@ -361,7 +417,6 @@ public:
         nDefaultPort = 18770;
         nPruneAfterHeight = 1000;
 
-        uint32_t nGenesisTime = 1537466400;  // Thursday, September 20, 2018 12:00:00 PM GMT-06:00
 
         // This is used inorder to mine the genesis block. Once found, we can use the nonce and block hash found to create a valid genesis block
 //        /////////////////////////////////////////////////////////////////
@@ -377,7 +432,7 @@ public:
 //        uint256 TempHashHolding = uint256S("0x0000000000000000000000000000000000000000000000000000000000000000");
 //        uint256 BestBlockHash = uint256S("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 //        for (int i=0;i<40000000;i++) {
-//            genesis = CreateGenesisBlock(nGenesisTime, i, 0x1e00ffff, 2, 5000 * COIN);
+//            genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, i, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
 //            //genesis.hashPrevBlock = TempHashHolding;
 //            // Depending on when the timestamp is on the genesis block. You will need to use GetX16RHash or GetX16RV2Hash. Replace GetHash() with these below
 //            consensus.hashGenesisBlock = genesis.GetHash();
@@ -424,7 +479,9 @@ public:
 
 //        /////////////////////////////////////////////////////////////////
 
-        genesis = CreateGenesisBlock(nGenesisTime, 15615880, 0x1e00ffff, 2, 5000 * COIN);
+        // SYZGY genesis. Same manifest, own nTime (2026-09-26 09:00:00 UTC) and own
+        // difficulty. The proof fields are filled in by the dual-PoW re-mine.
+        genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
         // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
         // hardcoded constant demoted from a fatal assert to a non-fatal warning until
         // the dual-PoW genesis re-mine restores it.
@@ -517,8 +574,8 @@ public:
         nMessagingActivationBlock = 10080; // Messaging activated block height
         nRestrictedActivationBlock = 10080; // Restricted activated block height
 
-        nKAAAWWWPOWActivationTime = 1585159200; //Wed Mar 25 2020 18:00:00 UTC
-        nKAWPOWActivationTime = nKAAAWWWPOWActivationTime;
+        nKAAAWWWPOWActivationTime = 0;
+        nKAWPOWActivationTime = 0;
         /** RVN End **/
     }
 };
@@ -649,7 +706,10 @@ public:
 //        /////////////////////////////////////////////////////////////////
 
 
-        genesis = CreateGenesisBlock(1524179366, 1, 0x207fffff, 4, 5000 * COIN);
+        // SYZGY genesis. Same manifest and own nTime (2026-09-26 09:00:00 UTC). Regtest
+        // uses the same 0x200fff as the other networks so that the dual-PoW genesis proof
+        // is minable in seconds and the re-mine does not have to be repeated per network.
+        genesis = CreateGenesisBlock(SYZGY_GENESIS_MANIFEST, SYZGY_GENESIS_TIME, 0, SYZGY_GENESIS_BITS, 4, 5000 * COIN);
         // SYZGY: see the MAINNET block above -- canonical GetHash(), and the legacy
         // hardcoded constant demoted from a fatal assert to a non-fatal warning until
         // the dual-PoW genesis re-mine restores it.
@@ -728,11 +788,11 @@ public:
         nMessagingActivationBlock = 0; // Messaging activated block height
         nRestrictedActivationBlock = 0; // Restricted activated block height
 
-        // TODO, we need to figure out what to do with this for regtest. This effects the unit tests
-        // For now we can use a timestamp very far away
-        // If you are looking to test the kawpow hashing function in regtest. You will need to change this number
-        nKAAAWWWPOWActivationTime = 3582830167;
-        nKAWPOWActivationTime = nKAAAWWWPOWActivationTime;
+        // SYZGY: dual-PoW from the genesis block. See the MAINNET comment -- the previous
+        // far-future sentinel here (3582830167) put the regtest genesis on the legacy
+        // x16rv2 branch, which is what produced the ReadBlockFromDisk header error.
+        nKAAAWWWPOWActivationTime = 0;
+        nKAWPOWActivationTime = 0;
         /** RVN End **/
     }
 };
