@@ -22,8 +22,11 @@
 #include "rpc/server.h"
 #include "rpc/register.h"
 #include "script/sigcache.h"
+#include "syzgy/randomx_glue.h"
 
 #include <memory>
+
+#include <boost/test/unit_test.hpp>
 
 uint256 insecure_rand_seed = GetRandHash();
 FastRandomContext insecure_rand_ctx(insecure_rand_seed);
@@ -46,6 +49,24 @@ BasicTestingSetup::BasicTestingSetup(const std::string &chainName)
     fCheckBlockIndex = true;
     SelectParams(chainName);
     noui_connect();
+
+    // SYZGY (FR-01): bring the RandomX (CPU) half of the dual proof online here, in the base
+    // fixture, because consensus code in this test binary now FAILS CLOSED without it -- a suite
+    // that mines or validates a block and silently skipped the CPU half would be testing a
+    // configuration that cannot exist in ravend. The syzgy:: glue initialises exactly once per
+    // process, so this costs one dataset build (~50 s, ~2.4 GiB) for the whole binary rather
+    // than one per suite fixture.
+    {
+        std::string strRandomXError;
+        BOOST_REQUIRE_MESSAGE(syzgy::RandomXInit(strRandomXError),
+                              "RandomX must be available for the SYZGY dual-PoW consensus rules: "
+                              << strRandomXError);
+        const uint256 epoch0Seed = syzgy::RandomXEpoch0Seed(GetParams().GenesisBlock().hashMerkleRoot);
+        BOOST_REQUIRE_MESSAGE(!epoch0Seed.IsNull(),
+                              "the epoch-0 RandomX seed must derive from the genesis merkle root");
+        BOOST_REQUIRE_MESSAGE(syzgy::RandomXSetActiveSeed(epoch0Seed, strRandomXError),
+                              "the epoch-0 RandomX seed must be selectable: " << strRandomXError);
+    }
 }
 
 BasicTestingSetup::~BasicTestingSetup()
@@ -142,9 +163,43 @@ TestChain100Setup::CreateAndProcessBlock(const std::vector<CMutableTransaction> 
     unsigned int extraNonce = 0;
     IncrementExtraNonce(&block, chainActive.Tip(), extraNonce);
 
+    // SYZGY (FR-01): the test chain must satisfy the SAME dual proof the node enforces, or
+    // every block built here is rejected by CheckBlockHeader and every integration test that
+    // builds a chain fails for a reason that has nothing to do with what it is testing.
+    //
+    // Both halves are ground together, exactly as src/rpc/mining.cpp does, because hashRandomX
+    // is part of SerializeHash(*this): writing a candidate hashRandomX changes the block
+    // identity and therefore the KawPoW mix, so the two cannot be solved independently and
+    // stitched together afterwards. Advancing only the nonce the failing half is keyed on keeps
+    // neither search space skipped.
     uint256 mix_hash;
-    while (!CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits, chainparams.GetConsensus())) { ++block.nNonce64; ++block.nNonce;};
-    block.mix_hash = mix_hash;
+    bool fSolved = false;
+    uint256 randomXHash;
+    std::string strRandomXError;
+    const uint256 randomXSeed = syzgy::RandomXActiveSeed();
+    for (uint64_t attempt = 0; attempt < 1000000 && !fSolved; ++attempt) {
+        mix_hash = uint256();
+        const bool fKawPoWSatisfied = CheckProofOfWork(block.GetHashFull(mix_hash), block.nBits,
+                                                      chainparams.GetConsensus());
+        if (fKawPoWSatisfied) {
+            block.mix_hash = mix_hash;
+            if (!syzgy::RandomXHash(block, randomXSeed, randomXHash, strRandomXError)) {
+                // Fail closed, loudly: a test chain with no CPU proof is not a test chain.
+                BOOST_REQUIRE_MESSAGE(false, "RandomXHash failed while mining a test block: "
+                                            << strRandomXError);
+            }
+            block.hashRandomX = randomXHash;
+            if (CheckProofOfWork(randomXHash, block.nBits, chainparams.GetConsensus())) {
+                fSolved = true;
+                break;
+            }
+            ++block.nRandomXNonce;
+        } else {
+            ++block.nNonce64;
+            ++block.nNonce;
+        }
+    }
+    BOOST_REQUIRE_MESSAGE(fSolved, "failed to mine a dual-PoW test block within the attempt limit");
 
     std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
     ProcessNewBlock(chainparams, shared_pblock, true, nullptr);

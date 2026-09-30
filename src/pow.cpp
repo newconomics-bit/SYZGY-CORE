@@ -304,11 +304,18 @@ bool GetRandomXSeedForHeight(const CBlockIndex* pindexPrev, const Consensus::Par
             // Otherwise resolve it on the candidate's own branch. GetAncestor() is exact; where
             // the skip pointers have not been built it degrades to a pprev walk, which is
             // correct and merely slower.
-            if (pindexPrev == nullptr) {
+            //
+            // The phashBlock test is a guard, not a formality. A real index entry always has it
+            // set (insertBlockIndex assigns it at creation), and an entry that does not is a
+            // stub whose pprev chain may be absent entirely -- GetAncestor() walks pprev with an
+            // assert that a release build compiles away, so a stub would be a null dereference
+            // rather than the fail-closed return this function promises. A seed derived from a
+            // chain that is not in the index is not a seed at all, so refuse it.
+            if (pindexPrev == nullptr || pindexPrev->phashBlock == nullptr) {
                 return false;
             }
             const CBlockIndex* pindexAnchor = pindexPrev->GetAncestor((int)nAnchorHeight);
-            if (pindexAnchor == nullptr) {
+            if (pindexAnchor == nullptr || pindexAnchor->phashBlock == nullptr) {
                 return false;
             }
             hashOut = pindexAnchor->GetBlockHash();

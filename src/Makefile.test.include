@@ -74,6 +74,7 @@ RAVEN_TESTS =\
   test/kawpow_tests.cpp \
   test/syzgy_index_tests.cpp \
   test/syzgy_sync_tests.cpp \
+  test/syzgy_dualpow_tests.cpp \
   test/raii_event_tests.cpp \
   test/random_tests.cpp \
   test/reverselock_tests.cpp \
@@ -124,6 +125,22 @@ test_test_raven_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 
 test_test_raven_LDADD += $(LIBRAVEN_CONSENSUS) $(LIBRAVEN_CRYPTO) $(BDB_LIBS) $(SSL_LIBS) $(CRYPTO_LIBS) $(MINIUPNPC_LIBS)
 test_test_raven_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS) -static
+
+# SYZGY (FR-01): the unit-test binary exercises the same consensus rules as ravend, and those
+# rules fail closed without the RandomX (CPU) half of the dual proof. Without librandomx.a
+# linked here, syzgy::RandomXLibraryPresent() is false and every dual-PoW check in the binary
+# would take its "UNAVAILABLE" branch -- the test binary would be testing a configuration that
+# cannot exist in the daemon, and would pass for entirely the wrong reason.
+if USE_RANDOMX
+test_test_raven_LDADD += $(LIBRANDOMX)
+test_test_raven_CPPFLAGS += $(RANDOMX_INCLUDES)
+# AND the link anchor. Adding $(LIBRANDOMX) to LDADD is NOT sufficient on its own: the RandomX C
+# entry points are referenced WEAKLY from syzgy/randomx_glue.cpp, and a weak undefined reference
+# never causes the linker to open an archive, so the members are silently not extracted and
+# every entry point still resolves to null. syzgy/randomx_anchor.cpp carries one ordinary STRONG
+# reference, which is what actually pulls the archive in. See src/syzgy/randomx_anchor.cpp.
+test_test_raven_SOURCES += syzgy/randomx_anchor.cpp
+endif
 
 if ENABLE_ZMQ
 test_test_raven_LDADD += $(ZMQ_LIBS)
