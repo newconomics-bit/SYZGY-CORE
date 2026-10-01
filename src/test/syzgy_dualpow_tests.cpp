@@ -683,4 +683,114 @@ BOOST_AUTO_TEST_CASE(syzgy_dual_pow_fails_closed_without_randomx)
     delete chain;
 }
 
+// ===========================================================================================
+// Height 0 -- the genesis carries BOTH proofs, and a missing parent is never an exemption
+// ===========================================================================================
+
+/**
+ * THE GENESIS TEST.
+ *
+ * The regtest genesis has no parent, so the parent-relative machinery has nothing to work
+ * from. The requirement is that this be handled EXPLICITLY and that it not fail open. Two
+ * things are asserted:
+ *
+ *   1. the shipped regtest genesis genuinely carries a valid KawPoW proof AND a valid
+ *      RandomX proof, and therefore PASSES the dual check. This is the FR-01 requirement at
+ *      height 0, and it is what lets a real regtest node load the chain at all;
+ *   2. a block at height > 0 with NO parent index is REJECTED, rather than having its CPU
+ *      target silently substituted with the easiest legal one. The ceiling is the correct CPU
+ *      target below the LWMA window, which is exactly what makes "assume the ceiling" look
+ *      harmless -- and that is why the fail-open shape is rejected outright.
+ */
+BOOST_AUTO_TEST_CASE(syzgy_genesis_carries_both_proofs_and_a_missing_parent_is_not_an_exemption)
+{
+    const Consensus::Params& params = RegtestParams();
+    const CBlock& genesis = GetParams().GenesisBlock();
+    const uint256 seed = Epoch0Seed();
+
+    // --- (1) the shipped genesis, dual-checked ------------------------------------------------
+    BOOST_REQUIRE_MESSAGE(genesis.nHeight == 0, "the genesis block must be at height 0");
+    BOOST_CHECK_MESSAGE(genesis.hashPrevBlock.IsNull(),
+        "the genesis block has no parent -- that is the case this test is about");
+    BOOST_CHECK_MESSAGE(!genesis.hashRandomX.IsNull(),
+        "the regtest genesis must carry a RandomX proof; FR-01 has no genesis exemption");
+    BOOST_CHECK_MESSAGE(!genesis.mix_hash.IsNull(),
+        "the regtest genesis must carry a KawPoW proof; FR-01 has no genesis exemption");
+
+    // Both halves proven good independently first, so that a pass below is attributable to the
+    // dual check accepting a real pair and not to some degenerate target.
+    {
+        uint256 mix;
+        const uint256 kawpowHash = KAWPOWHash(genesis, mix);
+        BOOST_REQUIRE_MESSAGE(mix == genesis.mix_hash,
+            "the genesis's recomputed KawPoW mix must equal its claimed mix_hash");
+        BOOST_REQUIRE_MESSAGE(CheckProofOfWork(kawpowHash, genesis.nBits, params),
+            "the genesis's KawPoW proof must meet the GPU target on its own");
+        uint256 rx;
+        std::string rxError;
+        BOOST_REQUIRE_MESSAGE(syzgy::RandomXHash(genesis, seed, rx, rxError),
+            "recomputing the genesis's RandomX hash must succeed: " << rxError);
+        BOOST_REQUIRE_MESSAGE(rx == genesis.hashRandomX,
+            "the genesis's hashRandomX must be the RandomX hash of the genesis template");
+    }
+
+    std::string strError;
+    BOOST_CHECK_MESSAGE(CheckDualProofOfWork(genesis, static_cast<const CBlockIndex*>(nullptr), params, seed, strError),
+        "the regtest genesis carries both proofs and must PASS the dual check: " << strError);
+
+    // The parent-resolving overload must reach the same verdict from the other direction.
+    strError.clear();
+    BOOST_CHECK_MESSAGE(CheckDualProofOfWork(genesis, params, seed, strError),
+        "the parent-resolving overload must accept the genesis too: " << strError);
+
+    // Corrupting EITHER half of the genesis must now be rejected, which is what proves the
+    // acceptance above came from checking both proofs rather than from a short circuit.
+    {
+        CBlockHeader bad = genesis;
+        bad.hashRandomX = uint256S("00000000000000000000000000000000000000000000000000000000000000ff");
+        std::string e;
+        BOOST_CHECK_MESSAGE(!CheckDualProofOfWork(bad, static_cast<const CBlockIndex*>(nullptr), params, seed, e),
+            "a genesis whose hashRandomX is wrong must be rejected -- the acceptance above must "
+                "come from the CPU proof being verified, not skipped");
+    }
+    {
+        CBlockHeader bad = genesis;
+        bad.mix_hash = uint256S("00000000000000000000000000000000000000000000000000000000000000fe");
+        std::string e;
+        BOOST_CHECK_MESSAGE(!CheckDualProofOfWork(bad, static_cast<const CBlockIndex*>(nullptr), params, seed, e),
+            "a genesis whose mix_hash is wrong must be rejected -- the acceptance above must come "
+                "from the GPU proof being verified, not skipped");
+    }
+
+    // --- (2) a non-genesis block with no parent index is rejected -----------------------------
+    {
+        RegisteredChain* chain = BuildRegisteredChain(3, /*cpuProof=*/true, /*gpuProof=*/true);
+        CBlockHeader header = MakeHeader(*chain, chain->size() - 1);
+        BOOST_REQUIRE_MESSAGE(MineProofs(header, /*fWantGpu=*/true, /*fWantCpu=*/true, seed),
+            "mining a real dual proof at the regtest ceiling must succeed");
+
+        // Sanity: with the parent supplied, the very same header is accepted. Without this the
+        // rejection below would prove nothing.
+        std::string e;
+        BOOST_REQUIRE_MESSAGE(CheckDualProofOfWork(header, chain->tip(), params, seed, e),
+            "the same header with its parent must be accepted: " << e);
+
+        e.clear();
+        BOOST_CHECK_MESSAGE(!CheckDualProofOfWork(header, static_cast<const CBlockIndex*>(nullptr), params, seed, e),
+            "a genuine, fully-mined dual proof at height > 0 must still be REJECTED when no "
+                "parent index is supplied -- a missing parent is a missing derivation, not an "
+                "exemption");
+        BOOST_CHECK_MESSAGE(e.find("fail closed") != std::string::npos,
+            "the missing-parent rejection must say that it failed closed, got: " << e);
+
+        // And the same header reached through the parent-resolving overload, with the parent
+        // genuinely absent from mapBlockIndex, must be rejected by that path instead.
+        mapBlockIndex.erase(header.hashPrevBlock);
+        e.clear();
+        BOOST_CHECK_MESSAGE(!CheckDualProofOfWork(header, params, seed, e),
+            "the parent-resolving overload must reject a block whose parent is unknown");
+        delete chain;
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

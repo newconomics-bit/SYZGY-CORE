@@ -91,8 +91,12 @@ void GetNextDualWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* 
  *   * a null epoch seed where the CPU proof is required -> false, "null seed".
  *   * a derived CPU target that is malformed or above randomxLimit -> false, before the proof is
  *     even evaluated.
- *   * the parent index cannot be resolved at a height where the CPU target is no longer simply
- *     the bootstrap ceiling -> false, "cannot derive" (see the parent-less overload).
+ *   * pindexPrev == nullptr on a block of height > 0 -> false, "cannot derive". The bootstrap
+ *     ceiling IS the correct CPU target below the LWMA window, which is exactly what makes
+ *     substituting it for a MISSING derivation look harmless; it is rejected outright rather
+ *     than left to the caller's discretion, because "assume the ceiling" is a fail-open shape.
+ *     Height 0 is the one admitted null-parent case, and it is handled explicitly: FR-01 has no
+ *     genesis exemption, so the mode there is stated as DUAL_POW rather than inherited.
  *
  * @param randomxSeed the epoch seed, from GetRandomXSeedForHeight().
  * @return true only if every proof required by the mode is present and valid.

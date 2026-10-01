@@ -408,6 +408,29 @@ bool CheckDualProofOfWork(const CBlockHeader& block, const CBlockIndex* pindexPr
         gpuBits = UintToArith256(params.kawpowLimit).GetCompact();
     }
 
+    // ---------------------------------------------------------------------------------------
+    // THE PARENT IS NOT OPTIONAL, AND ITS ABSENCE IS NOT AN EXEMPTION.
+    //
+    // Below M = nSyzgySyncWindow-1 the bootstrap ceiling IS the correct CPU target, so a null
+    // parent looks harmless at first glance. It is not: at height h > 0 the CPU target is
+    // supposed to be derived from a committed window, and substituting the easiest legal target
+    // for a MISSING derivation is a weaker check than the one FR-01 asks for. Every real caller
+    // (ContextualCheckBlockHeader and the txdb index-load re-verification) passes the parent it
+    // actually has, which is non-null for every block above height 0, so this branch is
+    // unreachable in normal operation -- which is exactly why it is stated as a hard rejection
+    // rather than left to the caller's discretion. It was added because "assume the ceiling"
+    // is a fail-open shape and the requirement is that there be none.
+    //
+    // Height 0 is the one admitted null-parent case, handled just above, where the ceiling is
+    // the correct answer rather than a substitute for a missing derivation.
+    // ---------------------------------------------------------------------------------------
+    if (pindexPrev == nullptr && block.nHeight > 0) {
+        strError = strprintf("SYZGY: no parent index for height %u, so the RandomX target cannot "
+                             "be derived -- refusing the block (fail closed)",
+                             block.nHeight);
+        return false;
+    }
+
     const bool fGpuRequired = (mode != syzgy::SyncMode::SINGLE_ALO_CPU);
     const bool fCpuRequired = (mode != syzgy::SyncMode::SINGLE_ALO_GPU);
 
