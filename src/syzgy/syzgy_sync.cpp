@@ -623,9 +623,27 @@ void GetNextDualWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader* 
             // chain to derive a target from. Hold whatever the caller already had: no target is
             // loosened and none is tightened, and the mode stays strict dual-PoW so FR-01 still
             // requires both proofs. Never guess a difficulty from a header we cannot place.
+            //
+            // "Hold" is not "emit unchecked". The held value is still pushed through
+            // ApplyGuardrails(), because the per-algorithm ceilings (randomxLimit /
+            // kawpowLimit) are absolute and must hold on EVERY exit from this function, not
+            // only on the ones that retarget. The header's single nBits is the GPU target, so
+            // pindexLast->nBits is the value being held on the GPU side; passing it as BOTH the
+            // previous and the desired value makes the +/-n% band a no-op (desired == prev) and
+            // leaves only the limit clamp able to bind. On any chain that was itself within
+            // limits -- i.e. every real chain -- this is therefore exactly the identity, and it
+            // only ever bites on a parent whose nBits was already out of range.
             modeOut = SyncMode::DUAL_POW;
-            cpuBitsOut = (pindexLast != nullptr) ? (unsigned int)pindexLast->nBits : 0u;
-            gpuBitsOut = cpuBitsOut;
+            const unsigned int held = (pindexLast != nullptr) ? (unsigned int)pindexLast->nBits : 0u;
+            if (held == 0) {
+                // No parent index at all: there is nothing to hold and nothing to clamp against.
+                cpuBitsOut = 0u;
+                gpuBitsOut = 0u;
+                return;
+            }
+            const SyncGuardrails g = syzgy::ApplyGuardrails(held, held, held, held, params);
+            cpuBitsOut = g.nextCpuBits;
+            gpuBitsOut = g.nextGpuBits;
             return;
         }
         pindexParent = it->second;

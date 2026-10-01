@@ -23,6 +23,7 @@
 #include "chainparamsbase.h"
 #include "amount.h"
 #include "consensus/params.h"
+#include "pow.h"
 #include "syzgy/syzgy_lwma.h"
 #include "syzgy/syzgy_sync.h"
 #include "uint256.h"
@@ -939,6 +940,165 @@ BOOST_AUTO_TEST_CASE(syzgy_consensus_params_are_wired_on_every_network)
         "regtest must start both algorithms at the same target");
     BOOST_CHECK_MESSAGE(reg.nSyzgyTailEmissionThreshold == 1 * COIN,
         "the tail emission threshold must be 1 SYZ, got " << reg.nSyzgyTailEmissionThreshold);
+}
+
+// -------------------------------------------------------------------------------------------
+// FR-03 -- the GPU side retargets against kawpowLimit, NOT powLimit
+// -------------------------------------------------------------------------------------------
+
+/**
+ * THE FR-03 PER-ALGORITHM TEST.
+ *
+ * Why this test has to build its own params. On all three shipped networks
+ * powLimit == kawpowLimit == randomxLimit, so a test written against the real params CANNOT
+ * distinguish "the GPU retargets against kawpowLimit" from "the GPU retargets against
+ * powLimit" -- both produce the same number and the test passes either way. That is a test
+ * that proves nothing.
+ *
+ * So this test constructs a params copy in which the two limits DELIBERATELY DIFFER, with
+ * powLimit made EASIER (numerically larger) than kawpowLimit:
+ *
+ *     powLimit    = 0x7fff...ff   -> compact 0x207fffff   (the EASY one; the wrong answer)
+ *     kawpowLimit = SetCompact(0x1d00ffff)  ~2^224      (the HARD one; the RIGHT answer)
+ *
+ * Any code path that still reads powLimit for the GPU side now returns 0x207fffff and fails
+ * these assertions; only a path that reads kawpowLimit returns 0x1d00ffff. randomxLimit is
+ * set equal to kawpowLimit so the CPU side is unaffected by the substitution and any failure
+ * is unambiguously on the GPU half.
+ */
+BOOST_AUTO_TEST_CASE(syzgy_gpu_side_retargets_against_kawpow_limit)
+{
+    Consensus::Params params = RegtestParams();
+
+    const unsigned int kKawpowBits = 0x1d00ffff;
+    params.kawpowLimit  = ArithToUint256(arith_uint256().SetCompact(kKawpowBits));
+    params.randomxLimit = params.kawpowLimit;
+    params.powLimit     = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    // The legacy min-difficulty shortcut inside DarkGravityWave is a single-algorithm rule
+    // that predates dual-PoW and returns powLimit; it is disabled here so that the assertion
+    // below is about the RETARGET bound, not about that pre-KawPoW special case.
+    params.fPowAllowMinDifficultyBlocks = false;
+
+    const unsigned int kPowLimitBits = UintToArith256(params.powLimit).GetCompact();
+    BOOST_REQUIRE_MESSAGE(kPowLimitBits != kKawpowBits,
+        "this test is only meaningful when powLimit and kawpowLimit disagree, got 0x"
+            << std::hex << kPowLimitBits << " for both" << std::dec);
+    BOOST_REQUIRE_MESSAGE(arith_uint256().SetCompact(kKawpowBits) < UintToArith256(params.powLimit),
+        "this test needs powLimit to be the EASIER of the two, otherwise the two possible wrong "
+        "and right answers are not distinguishable");
+
+    // --- Layer 5: the guardrail ceiling on the GPU side ------------------------------
+    {
+        // Ask for a GPU target far above kawpowLimit. The only bound that may apply is
+        // kawpowLimit itself, so the band is opened wide enough that the +/-n% guardrail can
+        // never be what clamps first. If the ceiling were powLimit the answer would be
+        // kPowLimitBits.
+        Consensus::Params wide = params;
+        wide.nSyzgySyncMaxRetargetPercent = 100000;
+        const syzgy::SyncGuardrails g =
+            syzgy::ApplyGuardrails(kKawpowBits, kKawpowBits, kPowLimitBits, kPowLimitBits, wide);
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(g.nextGpuBits)
+                                == arith_uint256().SetCompact(kKawpowBits),
+            "FR-03: the GPU target must be clamped to kawpowLimit, not powLimit (got 0x"
+                << std::hex << g.nextGpuBits << ", powLimit compact 0x" << kPowLimitBits
+                << ", kawpowLimit compact 0x" << kKawpowBits << std::dec << ")");
+        // The CPU side is bounded by ITS OWN limit, which is a different field; here it is
+        // coincidentally the same value, so the assertion pins only that the CPU side is not
+        // accidentally bounded by the (easier) powLimit either.
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(g.nextCpuBits) <= UintToArith256(params.randomxLimit),
+            "FR-03: the CPU target must be clamped to randomxLimit, not powLimit");
+    }
+
+    // --- Layer 4: Dark Gravity Wave itself ------------------------------------------
+    {
+        // A 250-block chain, past regtest's nDGWActivationBlock of 200, so GetNextWorkRequired
+        // really dispatches to DarkGravityWave. Every block sits at 0x207fffff -- i.e. at
+        // powLimit, which is EASIER than kawpowLimit -- and every block is exactly 60 s apart,
+        // so DGW's own arithmetic is an identity and kawpowLimit is the only thing that can
+        // move the answer.
+        BuiltChain* bc = BuildChain(250, kPowLimitBits, 1700000000, 60, true, true);
+        CBlockHeader hdr;
+        hdr.nVersion = 4;
+        hdr.nHeight = 251;
+        hdr.nBits = kPowLimitBits;
+        hdr.nTime = (uint32_t)(1700000000 + 250 * 60);
+
+        const unsigned int gpu = GetNextWorkRequired(bc->tip(), &hdr, params);
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(gpu) == arith_uint256().SetCompact(kKawpowBits),
+            "FR-03: Dark Gravity Wave must bound the GPU target at kawpowLimit, not powLimit "
+                "(got 0x" << std::hex << gpu << "; powLimit would be 0x" << kPowLimitBits
+                << ", kawpowLimit is 0x" << kKawpowBits << std::dec << ")");
+
+        // The negative control, so the assertion above is not passing by accident: the same
+        // call against the UNMODIFIED regtest params (where both limits are 0x207fffff) must
+        // return 0x207fffff. Two different params, two different answers, one field apart.
+        {
+            const Consensus::Params plain = RegtestParams();
+            const unsigned int gpuPlain = GetNextWorkRequired(bc->tip(), &hdr, plain);
+            BOOST_CHECK_MESSAGE(gpuPlain == kPowLimitBits,
+                "the negative control must return the regtest powLimit compact (0x"
+                    << std::hex << gpuPlain << " vs 0x" << kPowLimitBits << std::dec
+                << "); if this fails the test above proves nothing");
+        }
+
+        delete bc;
+    }
+
+    // --- The wiring: GetNextDualWorkRequired must not leak powLimit to the GPU side ----
+    {
+        // Same chain, but through the full five-layer pipeline. Both classes are present, so
+        // neither is frozen, and the pipeline's GPU output must still respect kawpowLimit.
+        //
+        // pblock is nullptr on purpose: the chain is synthetic and its indexes are not in
+        // mapBlockIndex, so a header with a hashPrevBlock would take the unresolvable-parent
+        // fail-closed branch instead of the retarget branch this assertion is about. That
+        // branch is exercised separately, below.
+        BuiltChain* bc = BuildChain(250, kPowLimitBits, 1700000000, 60, true, true);
+
+        unsigned int cpuBits = 0, gpuBits = 0;
+        syzgy::SyncMode mode = syzgy::SyncMode::DUAL_POW;
+        syzgy::GetNextDualWorkRequired(bc->tip(), nullptr, params, cpuBits, gpuBits, mode);
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(gpuBits) <= UintToArith256(params.kawpowLimit),
+            "FR-03: the Sync Controller's GPU output must never exceed kawpowLimit, even when the "
+                "chain's own nBits sits at the (easier) powLimit (got 0x" << std::hex << gpuBits
+                << ")" << std::dec);
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(cpuBits) <= UintToArith256(params.randomxLimit),
+            "FR-03: the Sync Controller's CPU output must never exceed randomxLimit (got 0x"
+                << std::hex << cpuBits << ")" << std::dec);
+        BOOST_REQUIRE_MESSAGE(mode == syzgy::SyncMode::DUAL_POW,
+            "a fully dual chain must route to DUAL_POW, got " << (int)mode);
+        delete bc;
+    }
+
+    // --- The unresolvable-parent fail-closed branch ------------------------------------
+    {
+        // A header whose hashPrevBlock is not in mapBlockIndex cannot be placed, so the
+        // pipeline must not guess. It holds the parent's target and stays in DUAL_POW -- and
+        // it must still respect the per-algorithm ceilings on that held value, because the
+        // parent's nBits here is the powLimit, which is EASIER than kawpowLimit by
+        // construction. Before the guardrails were applied on this path the GPU output was
+        // the raw parent nBits, i.e. 0x207fffff, which is above kawpowLimit. That was found
+        // by this test, not by inspection.
+        BuiltChain* bc = BuildChain(3, kPowLimitBits, 1700000000, 60, true, true);
+        CBlockHeader orphan;
+        orphan.nVersion = 4;
+        orphan.nHeight = 4;
+        orphan.nBits = kPowLimitBits;
+        orphan.nTime = (uint32_t)(1700000000 + 4 * 60);
+        orphan.hashPrevBlock = uint256S("000000000000000000000000000000000000000000000000000000000000dead");
+
+        unsigned int cpuBits = 0, gpuBits = 0;
+        syzgy::SyncMode mode = syzgy::SyncMode::SINGLE_ALO_CPU;
+        syzgy::GetNextDualWorkRequired(bc->tip(), &orphan, params, cpuBits, gpuBits, mode);
+        BOOST_CHECK_MESSAGE(mode == syzgy::SyncMode::DUAL_POW,
+            "an unplaceable header must fall back to strict DUAL_PoW, never to an emergency mode "
+                "that would drop a proof obligation");
+        BOOST_CHECK_MESSAGE(arith_uint256().SetCompact(gpuBits) <= UintToArith256(params.kawpowLimit),
+            "FR-03: the fail-closed branch must still clamp the held GPU target to kawpowLimit "
+                "(got 0x" << std::hex << gpuBits << ", kawpowLimit 0x" << kKawpowBits << std::dec
+                << ")");
+        delete bc;
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
